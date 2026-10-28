@@ -1,0 +1,56 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    # LavaSrc — понимает ссылки Spotify и ищет эти треки на SoundCloud.
+    # Свежую версию смотри тут: https://github.com/topi314/LavaSrc/releases
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.7.3"
+      repository: "https://maven.lavalink.dev/releases"
+  server:
+    # Пароль берётся из .env (LAVALINK_PASSWORD), эта строка — запасной вариант
+    password: "youshallnotpass"
+    sources:
+      youtube: false        # YouTube отключён намеренно
+      soundcloud: true
+      bandcamp: true
+      http: true            # MP3-файлы и интернет-радио по прямой ссылке
+      twitch: false
+      vimeo: false
+      local: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    playerUpdateInterval: 5
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    soundcloudSearchEnabled: true
+    youtubeSearchEnabled: false
+    gc-warnings: true
+
+plugins:
+  lavasrc:
+    # Куда искать трек, найденный по ссылке Spotify
+    providers:
+      - "scsearch:%QUERY%"
+    sources:
+      # ЭКСПЕРИМЕНТАЛЬНО: без Spotify Premium используется неофициальный анонимный токен.
+      # Может перестать работать в любой момент. Если Lavalink не стартует — поставь false.
+      spotify: true
+      applemusic: false
+      deezer: false
+      yandexmusic: false
+      flowerytts: false
+      youtube: false
+    spotify:
+      clientId: ""
+      clientSecret: ""
+      preferAnonymousToken: true
+      countryCode: "US"
+      playlistLoadLimit: 6   # страниц по 100 треков
+      albumLoadLimit: 6
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
