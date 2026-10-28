@@ -19,6 +19,14 @@ db.exec(`
     created_at  INTEGER NOT NULL,
     empty_since INTEGER
   );
+  CREATE TABLE IF NOT EXISTS plays (
+    key       TEXT PRIMARY KEY,
+    title     TEXT NOT NULL,
+    author    TEXT,
+    uri       TEXT,
+    count     INTEGER NOT NULL DEFAULT 0,
+    last_at   INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS news_seen (
     feed TEXT NOT NULL,
     guid TEXT NOT NULL,

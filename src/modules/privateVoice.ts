@@ -60,7 +60,10 @@ export function setup(client: Client) {
       console.error('[pvc] Ошибка voiceStateUpdate:', e);
     }
   });
-  client.once(Events.ClientReady, () => void sweep(client));
+  client.once(Events.ClientReady, async () => {
+    await adoptOrphans(client).catch((e) => console.warn('[pvc] Поиск потерянных приваток:', e?.message));
+    await sweep(client);
+  });
   setInterval(() => void sweep(client), 60_000);
 }
 
@@ -108,7 +111,7 @@ async function createFor(member: GuildMember, state: VoiceState) {
   }
 
   const channel = await guild.channels.create({
-    name: `🍺 ${member.displayName}`.slice(0, 100),
+    name: `${PVC_PREFIX}${member.displayName}`.slice(0, 100),
     type: ChannelType.GuildVoice,
     parent: lobby.parentId ?? undefined,
     bitrate: lobby.bitrate,
@@ -116,6 +119,12 @@ async function createFor(member: GuildMember, state: VoiceState) {
   });
   // Права категории наследуются автоматически, добавляем права владельцу
   await channel.permissionOverwrites.edit(member.id, { ViewChannel: true, Connect: true, Speak: true, Stream: true });
+  // И самому боту — чтобы «Скрыть»/«Закрыть» не отрезали ему доступ и он мог удалить пустой канал
+  if (guild.members.me) {
+    await channel.permissionOverwrites
+      .edit(guild.members.me.id, { ViewChannel: true, Connect: true, ManageChannels: true, ManageRoles: true, MoveMembers: true })
+      .catch((e) => console.warn('[pvc] Не удалось выдать права боту в канале:', e?.message));
+  }
 
   q.insert({ channel_id: channel.id, guild_id: guild.id, owner_id: member.id, created_at: Date.now(), empty_since: null });
   await member.voice.setChannel(channel).catch(async () => {
@@ -124,13 +133,27 @@ async function createFor(member: GuildMember, state: VoiceState) {
   });
 }
 
+const PVC_PREFIX = '🍺 ';
+const UNKNOWN_CHANNEL = 10003;
+
 /** Раз в минуту: удаляем каналы, пустующие дольше PRIVATE_VC_IDLE_MINUTES. */
 async function sweep(client: Client) {
   const idleMs = config.privateVcIdleMinutes * 60_000;
   for (const row of q.all()) {
     const guild = client.guilds.cache.get(row.guild_id);
     if (!guild) continue;
-    const ch = await guild.channels.fetch(row.channel_id).catch(() => null);
+    let ch;
+    try {
+      ch = await guild.channels.fetch(row.channel_id);
+    } catch (e: any) {
+      // Вычёркиваем, только если канала действительно больше нет. Иначе (сеть, нет доступа) — попробуем позже
+      if (e?.code === UNKNOWN_CHANNEL) {
+        q.remove(row.channel_id);
+      } else {
+        console.warn(`[pvc] Не открыть канал ${row.channel_id}: ${e?.message} — повторю через минуту`);
+      }
+      continue;
+    }
     if (!ch || !ch.isVoiceBased()) {
       q.remove(row.channel_id);
       continue;
@@ -143,10 +166,43 @@ async function sweep(client: Client) {
     if (!row.empty_since) {
       q.setEmpty(row.channel_id, Date.now());
     } else if (Date.now() - row.empty_since >= idleMs) {
-      await ch.delete('Приватный канал пустовал').catch(() => {});
-      q.remove(row.channel_id);
-      renameLog.delete(row.channel_id);
+      try {
+        await ch.delete('Приватный канал пустовал');
+        q.remove(row.channel_id);
+        renameLog.delete(row.channel_id);
+        console.log(`[pvc] Удалён пустой канал «${ch.name}»`);
+      } catch (e: any) {
+        if (e?.code === UNKNOWN_CHANNEL) q.remove(row.channel_id);
+        else console.warn(`[pvc] Не удалось удалить «${ch.name}»: ${e?.message} — повторю через минуту`);
+      }
     }
+  }
+}
+
+/**
+ * При запуске: находим «потерянные» приватки — голосовые каналы в категории лобби с названием «🍺 …»,
+ * которых нет в базе (остались от прошлых версий бота). Берём их обратно под учёт:
+ * пустые удалятся через PRIVATE_VC_IDLE_MINUTES, занятые — когда опустеют.
+ */
+async function adoptOrphans(client: Client) {
+  const lobbyId = getSetting('channel.vc_lobby');
+  if (!lobbyId) return;
+  for (const guild of client.guilds.cache.values()) {
+    const lobby = await guild.channels.fetch(lobbyId).catch(() => null);
+    if (!lobby) continue;
+    const all = await guild.channels.fetch().catch(() => null);
+    if (!all) continue;
+    let adopted = 0;
+    for (const ch of all.values()) {
+      if (!ch || ch.id === lobbyId || ch.type !== ChannelType.GuildVoice) continue;
+      if (ch.parentId !== lobby.parentId || !ch.name.startsWith(PVC_PREFIX)) continue;
+      if (q.get(ch.id)) continue;
+      const humans = ch.members.filter((m) => !m.user.bot);
+      const owner = humans.first()?.id ?? client.user!.id;
+      q.insert({ channel_id: ch.id, guild_id: guild.id, owner_id: owner, created_at: Date.now(), empty_since: humans.size ? null : Date.now() });
+      adopted++;
+    }
+    if (adopted) console.log(`[pvc] Найдено потерянных приваток: ${adopted} — снова под присмотром`);
   }
 }
 

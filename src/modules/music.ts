@@ -15,7 +15,7 @@ import {
 } from 'discord.js';
 import { LavalinkManager, type Player, type Track } from 'lavalink-client';
 import { config } from '../config';
-import { getSetting } from '../db';
+import { db, getSetting } from '../db';
 import type { ComponentInteraction } from '../types';
 import { baseEmbed, formatDuration, isManager, respond, truncate } from '../util';
 
@@ -116,6 +116,11 @@ export function setup(client: Client) {
 
   manager.on('trackStart', (player: Player, track: any) => {
     void showPanel(client, player, true);
+    try {
+      if (track) recordPlay(track);
+    } catch (e) {
+      console.warn('[music] Статистика:', (e as Error).message);
+    }
     if (player.get('radio')) {
       player.set('radioSeed', track);
       if (player.queue.tracks.length < 3) void radioFill(player);
@@ -333,10 +338,66 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
 }
 
+// ───────────────────────── популярное ─────────────────────────
+
+/** Запоминаем, что включали на сервере — для подсказок «🔥 Популярное» */
+function recordPlay(track: Track) {
+  const info: any = track.info;
+  if (!info?.title || info.isStream) return;
+  const key = `${info.author ?? ''} ${info.title}`.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  if (!key) return;
+  db.prepare(
+    `INSERT INTO plays (key, title, author, uri, count, last_at) VALUES (?, ?, ?, ?, 1, ?)
+     ON CONFLICT(key) DO UPDATE SET count = count + 1, last_at = excluded.last_at, uri = COALESCE(excluded.uri, uri)`,
+  ).run(key, info.title, info.author ?? null, info.uri ?? null, Date.now());
+}
+
+function serverTop(limit: number) {
+  return db
+    .prepare('SELECT title, author, uri, count FROM plays ORDER BY count DESC, last_at DESC LIMIT ?')
+    .all(limit) as { title: string; author: string | null; uri: string | null; count: number }[];
+}
+
+let chartCache: { at: number; items: { artist: string; title: string }[] } | null = null;
+
+/** Мировой чарт Deezer (кэш на 6 часов) */
+async function deezerChart(): Promise<{ artist: string; title: string }[]> {
+  if (chartCache && Date.now() - chartCache.at < 6 * 60 * 60_000) return chartCache.items;
+  try {
+    const res = await fetch('https://api.deezer.com/chart/0/tracks?limit=25', { signal: AbortSignal.timeout(2000) });
+    const json: any = await res.json();
+    const items = (json?.data ?? []).map((t: any) => ({ artist: t.artist?.name ?? '', title: t.title_short ?? t.title ?? '' }));
+    if (items.length) chartCache = { at: Date.now(), items };
+    return items;
+  } catch {
+    return chartCache?.items ?? [];
+  }
+}
+
+async function popularChoices(): Promise<{ name: string; value: string }[]> {
+  const out: { name: string; value: string }[] = [];
+  const seenKeys = new Set<string>();
+  for (const p of serverTop(10)) {
+    const label = `🔥 ${p.author ? `${p.author} — ` : ''}${p.title} · ${p.count}×`;
+    const value = p.uri && p.uri.length <= 100 ? p.uri : `${p.author ?? ''} ${p.title}`.trim();
+    out.push({ name: truncate(label, 100), value: value.slice(0, 100) });
+    seenKeys.add(`${p.author ?? ''} ${p.title}`.toLowerCase());
+  }
+  for (const c of await withTimeout(deezerChart(), 2000) ?? []) {
+    if (out.length >= 25) break;
+    if (seenKeys.has(`${c.artist} ${c.title}`.toLowerCase())) continue;
+    out.push({ name: truncate(`🌍 ${c.artist} — ${c.title}`, 100), value: `${c.artist} ${c.title}`.slice(0, 100) });
+  }
+  return out;
+}
+
 export async function onAutocomplete(i: AutocompleteInteraction) {
   if (i.commandName !== 'play') return;
   const typed = i.options.getFocused().trim();
   const asTyped = typed ? [{ name: `🔍 Искать: ${truncate(typed, 85)}`, value: typed.slice(0, 100) }] : [];
+
+  // Пока ничего не введено — показываем популярное
+  if (!typed) return i.respond(await popularChoices().catch(() => [])).catch(() => {});
 
   // Ссылки и слишком короткие запросы не ищем — просто подставляем как есть
   if (typed.length < 3 || /^https?:\/\//i.test(typed)) return i.respond(asTyped).catch(() => {});
