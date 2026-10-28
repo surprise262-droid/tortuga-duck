@@ -35,9 +35,12 @@ const PREVIEW_MAX_MS = 31_000; // превью Go+ на SoundCloud длятся 
 export const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Включить трек/плейлист: поиск SoundCloud, ссылка Spotify/SoundCloud, MP3-файл или радио')
-    .addStringOption((o) => o.setName('query').setDescription('Название или ссылка'))
-    .addAttachmentOption((o) => o.setName('file').setDescription('Свой MP3/OGG/WAV-файл')),
+    .setDescription('Включить трек или плейлист: название, ссылка SoundCloud/Spotify/Bandcamp или радио')
+    .addStringOption((o) => o.setName('query').setDescription('Название или ссылка').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('play_file')
+    .setDescription('Включить свой аудиофайл (MP3, OGG, WAV, M4A, FLAC)')
+    .addAttachmentOption((o) => o.setName('file').setDescription('Аудиофайл').setRequired(true)),
   new SlashCommandBuilder().setName('skip').setDescription('Пропустить текущий трек'),
   new SlashCommandBuilder().setName('pause').setDescription('Пауза'),
   new SlashCommandBuilder().setName('resume').setDescription('Продолжить'),
@@ -172,6 +175,8 @@ export async function onCommand(i: ChatInputCommandInteraction) {
   switch (i.commandName) {
     case 'play':
       return play(i);
+    case 'play_file':
+      return playFile(i);
 
     case 'queue':
       return respond(i, { embeds: [queueEmbed(player)] });
@@ -228,17 +233,75 @@ export async function onCommand(i: ChatInputCommandInteraction) {
   }
 }
 
-async function play(i: ChatInputCommandInteraction<'cached'>) {
-  const member = i.member;
-  const voice = member.voice.channel;
-  if (!voice) return respond(i, '🔇 Сначала зайди в голосовой канал.');
+// ───────────────────────── загрузка треков ─────────────────────────
 
-  const file = i.options.getAttachment('file');
-  const text = i.options.getString('query')?.trim();
-  if (!file && !text) return respond(i, '❓ Укажи название/ссылку или прикрепи аудиофайл.');
-  if (file && file.contentType && !/^(audio|video)\//.test(file.contentType)) {
-    return respond(i, '❌ Это не похоже на аудиофайл. Подойдут MP3, OGG, WAV, M4A.');
+interface LoadResult {
+  kind: 'track' | 'playlist' | 'search' | 'empty' | 'error';
+  tracks: Track[];
+  playlistName?: string;
+  error?: string;
+}
+
+/**
+ * Запрашиваем треки у Lavalink напрямую через REST (/v4/loadtracks).
+ * Так бот не зависит от того, под каким именем плагин регистрирует источник
+ * (SoundCloud обслуживает плагин Soundy, а не встроенный источник Lavalink).
+ */
+async function loadTracks(identifier: string, requester: unknown): Promise<LoadResult> {
+  const { host, port, password } = config.lavalink;
+  const url = `http://${host}:${port}/v4/loadtracks?identifier=${encodeURIComponent(identifier)}`;
+  let body: any;
+  try {
+    const res = await fetch(url, { headers: { Authorization: password } });
+    if (!res.ok) return { kind: 'error', tracks: [], error: `Lavalink ответил HTTP ${res.status}` };
+    body = await res.json();
+  } catch (e) {
+    return { kind: 'error', tracks: [], error: `Lavalink недоступен: ${(e as Error).message}` };
   }
+
+  const utils = manager.utils as any;
+  const build = (raw: any): Track =>
+    typeof utils?.buildTrack === 'function'
+      ? utils.buildTrack(raw, requester)
+      : ({ encoded: raw.encoded, info: raw.info, pluginInfo: raw.pluginInfo ?? {}, userData: raw.userData ?? {}, requester } as any);
+  switch (body?.loadType) {
+    case 'track':
+      return { kind: 'track', tracks: [build(body.data)] };
+    case 'search':
+      return { kind: 'search', tracks: (body.data ?? []).map(build) };
+    case 'playlist':
+      return {
+        kind: 'playlist',
+        tracks: (body.data?.tracks ?? []).map(build),
+        playlistName: body.data?.info?.name,
+      };
+    case 'error':
+      return { kind: 'error', tracks: [], error: body.data?.message ?? body.data?.cause ?? 'неизвестная ошибка' };
+    default:
+      return { kind: 'empty', tracks: [] };
+  }
+}
+
+/** Поиск по названию: сначала SoundCloud, если пусто или ошибка — Bandcamp. */
+async function searchByText(text: string, requester: unknown): Promise<LoadResult> {
+  let last: LoadResult = { kind: 'empty', tracks: [] };
+  for (const prefix of ['scsearch', 'bcsearch']) {
+    const res = await loadTracks(`${prefix}:${text}`, requester);
+    if (res.tracks.length) return res;
+    if (res.kind === 'error') console.warn(`[music] ${prefix} «${text}»: ${res.error}`);
+    last = res;
+  }
+  return last;
+}
+
+/** Общая часть /play и /play_file: проверка голосового, плеер, очередь. */
+async function enqueue(
+  i: ChatInputCommandInteraction<'cached'>,
+  resolve: () => Promise<LoadResult>,
+  fileName?: string,
+) {
+  const voice = i.member.voice.channel;
+  if (!voice) return respond(i, '🔇 Сначала зайди в голосовой канал.');
 
   let player = manager.getPlayer(i.guildId);
   if (player && player.voiceChannelId !== voice.id) {
@@ -248,6 +311,31 @@ async function play(i: ChatInputCommandInteraction<'cached'>) {
   }
 
   await i.deferReply();
+
+  const res = await resolve();
+  if (!res.tracks.length) {
+    if (res.kind === 'error') {
+      console.warn(`[music] Ошибка загрузки: ${res.error}`);
+      return i.editReply(`⚠️ Не получилось загрузить трек: ${truncate(res.error ?? '', 200)}`);
+    }
+    return i.editReply('🔍 Ничего не нашёл. Попробуй по-другому: «исполнитель — название» или ссылку.');
+  }
+
+  let added: Track[];
+  let label: string;
+  if (res.kind === 'playlist') {
+    added = res.tracks;
+    label = `📃 Добавлен плейлист **${truncate(res.playlistName ?? 'плейлист', 80)}** — ${added.length} треков`;
+  } else {
+    // В поиске пропускаем 30-секундные превью, если есть полноценная версия
+    const full =
+      res.kind === 'search'
+        ? res.tracks.find((t) => t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS) ?? res.tracks[0]
+        : res.tracks[0];
+    if (fileName) (full.info as any).title = fileName;
+    added = [full];
+    label = `➕ В очереди: **${truncate(full.info.title, 80)}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
+  }
 
   if (!player) {
     player = manager.createPlayer({
@@ -261,38 +349,27 @@ async function play(i: ChatInputCommandInteraction<'cached'>) {
   }
   if (!player.connected) await player.connect();
 
-  const query = file ? file.url : text!;
-  const isUrl = /^https?:\/\//i.test(query);
-  const res: any = await player.search(isUrl ? { query } : { query, source: 'scsearch' }, i.user);
-
-  if (!res || res.loadType === 'empty' || res.loadType === 'error' || !res.tracks?.length) {
-    return i.editReply('🔍 Ничего не нашёл. Попробуй по-другому: «исполнитель — название».');
-  }
-
-  let added: Track[];
-  let label: string;
-  if (res.loadType === 'playlist') {
-    added = res.tracks;
-    const name = res.playlist?.title ?? res.playlist?.name ?? 'плейлист';
-    label = `📃 Добавлен плейлист **${name}** — ${added.length} треков`;
-  } else {
-    // В поиске пропускаем 30-секундные превью Go+, если есть полноценная версия
-    const tracks: Track[] = res.tracks;
-    const full =
-      res.loadType === 'search'
-        ? tracks.find((t) => t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS) ?? tracks[0]
-        : tracks[0];
-    added = [full];
-    if (file) (full.info as any).title = file.name;
-    label = `➕ В очереди: **${truncate(full.info.title, 80)}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
-  }
-
   await player.queue.add(added);
   if (player.get('shuffle')) await player.queue.shuffle();
   if (!player.playing && !player.paused) await player.play();
   else await refreshPanel(player);
 
   return i.editReply(label);
+}
+
+async function play(i: ChatInputCommandInteraction<'cached'>) {
+  const text = i.options.getString('query', true).trim();
+  const isUrl = /^https?:\/\//i.test(text);
+  return enqueue(i, () => (isUrl ? loadTracks(text, i.user) : searchByText(text, i.user)));
+}
+
+async function playFile(i: ChatInputCommandInteraction<'cached'>) {
+  const file = i.options.getAttachment('file', true);
+  const looksLikeAudio =
+    (file.contentType && /^(audio|video)\//.test(file.contentType)) || /\.(mp3|ogg|oga|opus|wav|m4a|aac|flac|webm|mp4)$/i.test(file.name);
+  if (!looksLikeAudio) return respond(i, '❌ Это не похоже на аудиофайл. Подойдут MP3, OGG, WAV, M4A, FLAC.');
+  const title = file.name.replace(/\.[^.]+$/, '');
+  return enqueue(i, () => loadTracks(file.url, i.user), title);
 }
 
 async function skip(player: Player) {

@@ -1,7 +1,8 @@
 services:
   # Аудиосервер: декодирует и стримит музыку в голосовой канал
+  # (собирается из lavalink/Dockerfile: Lavalink 4 + плагин Soundy для SoundCloud)
   lavalink:
-    image: ghcr.io/lavalink-devs/lavalink:4
+    build: ./lavalink
     restart: unless-stopped
     environment:
       - _JAVA_OPTIONS=-Xmx768m

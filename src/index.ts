@@ -19,6 +19,11 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // нужен включённый Server Members Intent в Developer Portal
     GatewayIntentBits.GuildVoiceStates,
   ],
+  rest: {
+    // Discord разрешает менять канал (название и т.п.) редко. По умолчанию discord.js в таком случае
+    // молча ждёт до 10 минут, и кнопка «зависает». Вместо этого получаем ошибку и объясняем пользователю.
+    rejectOnRateLimit: (data) => data.method === 'PATCH' && data.route.startsWith('/channels'),
+  },
 });
 
 // Карта «имя команды → модуль»

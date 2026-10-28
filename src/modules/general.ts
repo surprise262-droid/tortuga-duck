@@ -18,7 +18,8 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       {
         name: '🎵 Музыка',
         value: [
-          '`/play` — трек или плейлист: SoundCloud, ссылка Spotify, MP3-файл, радио',
+          '`/play` — название или ссылка: SoundCloud, Spotify, Bandcamp, радио',
+          '`/play_file` — включить свой аудиофайл (MP3, OGG, WAV, M4A, FLAC)',
           '`/skip` `/pause` `/resume` `/stop` — управление (только из голосового канала)',
           '`/volume` — громкость, `/shuffle` — перемешивание, `/loop` — повтор',
           '`/queue` — очередь, `/remove` — убрать трек, `/nowplaying` — показать плеер',

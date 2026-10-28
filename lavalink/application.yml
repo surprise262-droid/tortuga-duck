@@ -13,7 +13,7 @@ lavalink:
     password: "youshallnotpass"
     sources:
       youtube: false        # YouTube отключён намеренно
-      soundcloud: true
+      soundcloud: false     # встроенный SoundCloud сломан — его заменяет плагин Soundy
       bandcamp: true
       http: true            # MP3-файлы и интернет-радио по прямой ссылке
       twitch: false
@@ -24,15 +24,20 @@ lavalink:
     playerUpdateInterval: 5
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
-    soundcloudSearchEnabled: true
+    soundcloudSearchEnabled: false
     youtubeSearchEnabled: false
     gc-warnings: true
 
 plugins:
+  # Soundy — SoundCloud (ссылки и поиск scsearch:). Jar кладётся в образ при сборке, см. lavalink/Dockerfile
+  soundy:
+    enabled: true
+
   lavasrc:
-    # Куда искать трек, найденный по ссылке Spotify
+    # Куда искать трек, найденный по ссылке Spotify (по порядку)
     providers:
       - "scsearch:%QUERY%"
+      - "bcsearch:%QUERY%"
     sources:
       # ЭКСПЕРИМЕНТАЛЬНО: без Spotify Premium используется неофициальный анонимный токен.
       # Может перестать работать в любой момент. Если Lavalink не стартует — поставь false.

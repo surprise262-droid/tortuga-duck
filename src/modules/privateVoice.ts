@@ -4,6 +4,7 @@ import {
   ButtonStyle,
   ChannelType,
   Events,
+  MessageFlags,
   ModalBuilder,
   PermissionFlagsBits,
   TextInputBuilder,
@@ -229,15 +230,20 @@ export async function onComponent(i: ComponentInteraction) {
         const wait = Math.ceil((10 * 60_000 - (now - recent[0])) / 60_000);
         return respond(i, `⏳ Discord разрешает переименовать канал только 2 раза за 10 минут. Попробуй через ~${wait} мин.`);
       }
-      await channel.setName(name);
-      renameLog.set(channel.id, [...recent, now]);
-      return respond(i, `✏️ Канал теперь называется **${name}**.`);
+      return safely(i, async () => {
+        await channel.setName(name);
+        renameLog.set(channel.id, [...recent, now]);
+        return `✏️ Канал теперь называется **${name}**.`;
+      });
     }
     if (action === 'limitModal') {
-      const n = Number(i.fields.getTextInputValue('limit').trim());
-      if (!Number.isInteger(n) || n < 0 || n > 99) return respond(i, '❌ Нужно число от 0 до 99 (0 — без лимита).');
-      await channel.setUserLimit(n);
-      return respond(i, n === 0 ? '👥 Лимит снят.' : `👥 Лимит: **${n}**.`);
+      const raw = i.fields.getTextInputValue('limit').trim();
+      const n = Number(raw === '' ? '0' : raw);
+      if (!Number.isInteger(n) || n < 0 || n > 99) return respond(i, '❌ Нужно целое число от 0 до 99 (0 — без лимита).');
+      return safely(i, async () => {
+        await channel.edit({ userLimit: n });
+        return n === 0 ? '👥 Лимит снят.' : `👥 Лимит: **${n}**.`;
+      });
     }
     return;
   }
@@ -303,17 +309,25 @@ export async function onComponent(i: ComponentInteraction) {
           ),
       );
     case 'lock':
-      for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: false });
-      return respond(i, '🔒 Канал закрыт. Зайти смогут только те, кого ты пустишь (✅).');
+      return safely(i, async () => {
+        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: false });
+        return '🔒 Канал закрыт. Зайти смогут только те, кого ты пустишь (✅).';
+      });
     case 'unlock':
-      for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: null });
-      return respond(i, '🔓 Канал открыт для всех.');
+      return safely(i, async () => {
+        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: null });
+        return '🔓 Канал открыт для всех.';
+      });
     case 'hide':
-      for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: false });
-      return respond(i, '🙈 Канал скрыт из списка.');
+      return safely(i, async () => {
+        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: false });
+        return '🙈 Канал скрыт из списка.';
+      });
     case 'show':
-      for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: null });
-      return respond(i, '👁 Канал снова виден всем.');
+      return safely(i, async () => {
+        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: null });
+        return '👁 Канал снова виден всем.';
+      });
     case 'permit':
     case 'kick':
     case 'transfer': {
@@ -331,6 +345,28 @@ export async function onComponent(i: ComponentInteraction) {
       await transferOwnership(channel, row.owner_id, i.user.id);
       return respond(i, '🏴 Теперь это твой канал.');
     }
+  }
+}
+
+/**
+ * Сначала отвечаем Discord «думаю…» (у нас 3 секунды), потом меняем канал.
+ * Ошибки (лимиты Discord, нехватка прав) показываем пользователю понятным текстом.
+ */
+async function safely(i: ComponentInteraction, action: () => Promise<string>) {
+  if (!i.isRepliable()) return;
+  if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    return await i.editReply(await action());
+  } catch (e: any) {
+    console.warn(`[pvc] Ошибка действия ${i.customId}:`, e?.message ?? e);
+    let text = `⚠️ Не получилось: ${e?.message ?? 'неизвестная ошибка'}`;
+    if (e?.name === 'RateLimitError' || typeof e?.timeToReset === 'number') {
+      const min = Math.max(1, Math.ceil((e.timeToReset ?? 600_000) / 60_000));
+      text = `⏳ Discord временно запретил менять этот канал (слишком часто). Попробуй через ~${min} мин.`;
+    } else if (e?.code === 50013) {
+      text = '⚠️ У бота не хватает прав в этом канале. Попроси админа проверить права роли Tortuga Duck (Управлять каналами, Управлять правами).';
+    }
+    return i.editReply(text);
   }
 }
 
