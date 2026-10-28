@@ -1,0 +1,26 @@
+{
+  "name": "tortuga-duck",
+  "version": "1.0.0",
+  "description": "Tortuga Duck — Discord-бот для своих: музыка, приватные голосовые, приветствия, роли, новости",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.56",
+    "discord.js": "^14.16.3",
+    "lavalink-client": "^2.3.0",
+    "rss-parser": "^3.13.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}

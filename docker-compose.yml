@@ -1,0 +1,38 @@
+services:
+  # Аудиосервер: декодирует и стримит музыку в голосовой канал
+  lavalink:
+    image: ghcr.io/lavalink-devs/lavalink:4
+    restart: unless-stopped
+    environment:
+      - _JAVA_OPTIONS=-Xmx768m
+      - LAVALINK_SERVER_PASSWORD=${LAVALINK_PASSWORD}
+    volumes:
+      - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
+    expose:
+      - "2333"
+
+  # Сам бот
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - LAVALINK_HOST=lavalink
+      - LAVALINK_PORT=2333
+    depends_on:
+      - lavalink
+      - rsshub
+    volumes:
+      - ./data:/app/data       # база данных (настройки, приватки, прочитанные новости)
+      - ./config:/app/config   # роли, фразы приветствий, ленты новостей — можно править без пересборки
+      - ./assets:/app/assets   # картинки уток и фон приветствия
+
+  # RSSHub превращает Telegram-каналы (и сайты без RSS) в RSS-ленты.
+  # Нужен для аниме-новостей из @animolll. Доступен только боту, наружу не открыт.
+  rsshub:
+    image: diygod/rsshub:latest
+    restart: unless-stopped
+    environment:
+      - CACHE_EXPIRE=300
+    expose:
+      - "1200"
