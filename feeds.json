@@ -1,0 +1,31 @@
+{
+  "games": {
+    "title": "🎮 Игровые новости",
+    "color": "#5865F2",
+    "feeds": [
+      { "name": "StopGame", "url": "https://rss.stopgame.ru/rss_news.xml" },
+      { "name": "3DNews Игры", "url": "https://3dnews.ru/games/rss/" }
+    ]
+  },
+  "movies": {
+    "title": "🎬 Кино и сериалы",
+    "color": "#ED4245",
+    "feeds": [
+      { "name": "Кинопоиск: скоро (Telegram)", "url": "http://rsshub:1200/telegram/channel/kinopoisk_soon" }
+    ]
+  },
+  "anime": {
+    "title": "🍥 Аниме",
+    "color": "#EB459E",
+    "feeds": [
+      { "name": "AniMoll (Telegram)", "url": "http://rsshub:1200/telegram/channel/animolll" }
+    ]
+  },
+  "free": {
+    "title": "🎁 Халява",
+    "color": "#57F287",
+    "feeds": [
+      { "name": "GamerPower", "type": "gamerpower", "url": "https://www.gamerpower.com/api/giveaways?type=game&platform=pc" }
+    ]
+  }
+}
