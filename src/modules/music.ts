@@ -4,6 +4,7 @@ import {
   ButtonStyle,
   Events,
   GuildMember,
+  MessageFlags,
   SlashCommandBuilder,
   type AutocompleteInteraction,
   type ChatInputCommandInteraction,
@@ -75,6 +76,7 @@ export const commands = [
     .setDescription('Убрать трек из очереди')
     .addIntegerOption((o) => o.setName('position').setDescription('Номер в /queue').setRequired(true).setMinValue(1)),
   new SlashCommandBuilder().setName('nowplaying').setDescription('Показать плеер заново'),
+  new SlashCommandBuilder().setName('radio').setDescription('Радио по текущему треку: вкл/выкл — бот сам добавляет похожие треки'),
 ];
 
 // ───────────────────────── инициализация ─────────────────────────
@@ -112,8 +114,23 @@ export function setup(client: Client) {
   manager.nodeManager.on('error', (node: any, err: any) => console.error(`[music] Ошибка Lavalink (${node.id}):`, err?.message ?? err));
   manager.nodeManager.on('disconnect', (node: any) => console.warn(`[music] Lavalink отключился (${node.id})`));
 
-  manager.on('trackStart', (player: Player) => void showPanel(client, player, true));
-  manager.on('queueEnd', (player: Player) => void showPanel(client, player, false));
+  manager.on('trackStart', (player: Player, track: any) => {
+    void showPanel(client, player, true);
+    if (player.get('radio')) {
+      player.set('radioSeed', track);
+      if (player.queue.tracks.length < 3) void radioFill(player);
+    }
+  });
+  manager.on('queueEnd', (player: Player) => {
+    if (player.get('radio')) {
+      // Радио включено — подбираем ещё, а не показываем «очередь закончилась»
+      void radioFill(player).then((n) => {
+        if (!n) void showPanel(client, player, false);
+      });
+      return;
+    }
+    void showPanel(client, player, false);
+  });
   manager.on('trackError', (player: Player, track: any, payload: any) => {
     console.warn('[music] Ошибка трека:', track?.info?.title, payload?.exception?.message);
     void notify(client, player, `⚠️ Не получилось воспроизвести **${track?.info?.title ?? 'трек'}** — пропускаю.`);
@@ -225,6 +242,15 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       await p.setRepeatMode(mode);
       await refreshPanel(p);
       return respond(i, `🔁 Повтор: **${repeatLabel(mode)}**`, false);
+    }
+    case 'radio': {
+      const on = await toggleRadio(p);
+      await refreshPanel(p);
+      return respond(
+        i,
+        on ? '📻 Радио **включено** — подбираю похожие треки.' : '📻 Радио **выключено**.',
+        false,
+      );
     }
     case 'remove': {
       const pos = i.options.getInteger('position', true);
@@ -474,8 +500,181 @@ export async function onComponent(i: ComponentInteraction) {
     case 'volup':
       await p.setVolume(Math.min(150, p.volume + 10));
       break;
+    case 'radio': {
+      const on = await toggleRadio(p);
+      await i.update(panelPayload(p));
+      return i.followUp({
+        content: on
+          ? '📻 Радио **включено**: подбираю похожие треки — они встанут в очередь и будут добавляться дальше сами.'
+          : '📻 Радио **выключено**. Уже добавленные треки останутся в очереди.',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
   }
   await i.update(panelPayload(p));
+}
+
+// ───────────────────────── радио ─────────────────────────
+//
+// Радио по треку: подбор — Spotify Mix через LavaSrc (как «радио» в приложении Spotify),
+// запасной вариант — радио исполнителя на Deezer. Играются треки с SoundCloud.
+
+const RADIO_REQUESTER = { id: 'radio', username: '📻 Радио' };
+const radioBusy = new Set<string>();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function splitArtistTitle(info: { author?: string; title?: string }) {
+  let artist = info.author ?? '';
+  let title = info.title ?? '';
+  // На SoundCloud часто «Исполнитель - Название» в заголовке, а в author — ник загрузившего
+  const m = title.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  if (m) {
+    artist = m[1];
+    title = m[2];
+  }
+  title = title.replace(/\s*[([][^)\]]*(official|video|audio|lyric|clip|visuali[sz]er|prod|free download)[^)\]]*[)\]]/gi, '').trim();
+  return { artist: artist.trim(), title };
+}
+
+const trackKey = (artist: string, title: string) =>
+  `${artist} ${title}`.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+async function deezer(path: string): Promise<any> {
+  const res = await fetch(`https://api.deezer.com${path}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`Deezer HTTP ${res.status}`);
+  const json: any = await res.json();
+  if (json?.error) throw new Error(`Deezer: ${json.error.message ?? 'ошибка'}`);
+  return json;
+}
+
+/** Похожие треки по треку-«семени»: ищем исполнителя на Deezer и берём его радио. */
+async function similarTracks(seed: Track): Promise<{ artist: string; title: string }[]> {
+  const { artist, title } = splitArtistTitle(seed.info as any);
+  const found = await deezer(`/search?q=${encodeURIComponent(`${artist} ${title}`.trim())}&limit=1`);
+  let artistId = found?.data?.[0]?.artist?.id;
+  if (!artistId && artist) {
+    const a = await deezer(`/search/artist?q=${encodeURIComponent(artist)}&limit=1`);
+    artistId = a?.data?.[0]?.id;
+  }
+  if (!artistId) return [];
+  const radio = await deezer(`/artist/${artistId}/radio?limit=50`);
+  return (radio?.data ?? []).map((t: any) => ({ artist: t.artist?.name ?? '', title: t.title_short ?? t.title ?? '' }));
+}
+
+/**
+ * Spotify Mix по треку — тот же подбор, что у «радио» в приложении Spotify.
+ * Работает через плагин LavaSrc (sprec:mix:…), треки из микса LavaSrc сам находит и играет через SoundCloud.
+ * Чтобы найти трек в Spotify без API-ключей, берём его ISRC (код записи) из Deezer.
+ */
+async function spotifyMix(seed: Track): Promise<Track[]> {
+  const info: any = seed.info;
+  let query: string | undefined;
+  if (info.sourceName === 'spotify' && info.identifier) query = `sprec:mix:track:${info.identifier}`;
+  else if (info.isrc) query = `sprec:mix:isrc:${info.isrc}`;
+  else {
+    const { artist, title } = splitArtistTitle(info);
+    const found = await deezer(`/search?q=${encodeURIComponent(`${artist} ${title}`.trim())}&limit=1`);
+    const id = found?.data?.[0]?.id;
+    if (id) {
+      const t = await deezer(`/track/${id}`);
+      if (t?.isrc) query = `sprec:mix:isrc:${t.isrc}`;
+    }
+  }
+  if (!query) return [];
+  const res = await loadTracks(query, RADIO_REQUESTER);
+  if (res.kind === 'error') console.warn(`[music] Spotify Mix (${query}): ${res.error}`);
+  return res.tracks;
+}
+
+type RadioItem = { track?: Track; artist: string; title: string };
+
+/** Добавляет в очередь до count похожих треков. Возвращает, сколько добавлено. */
+async function radioFill(player: Player, count = 8): Promise<number> {
+  const gid = player.guildId;
+  if (radioBusy.has(gid)) return 0;
+  radioBusy.add(gid);
+  try {
+    const seed: Track | undefined =
+      player.queue.current ?? (player.queue.previous?.[0] as Track | undefined) ?? player.get('radioSeed');
+    if (!seed) return 0;
+
+    const seen = new Set<string>(player.get('radioPlayed') ?? []);
+    for (const t of [seed, ...player.queue.tracks] as Track[]) {
+      const s = splitArtistTitle(t.info as any);
+      seen.add(trackKey(s.artist, s.title));
+    }
+    const fresh = (items: RadioItem[]) => items.filter((c) => c.title && !seen.has(trackKey(c.artist, c.title)));
+
+    // Запас подобранных треков с прошлого раза — чтобы не дёргать Spotify на каждый трек
+    let pending: RadioItem[] = fresh(player.get('radioPending') ?? []);
+    let source: string = player.get('radioSource') ?? '';
+
+    if (pending.length < count) {
+      // 1) Spotify Mix
+      let mix: Track[] = [];
+      try {
+        mix = await spotifyMix(seed);
+      } catch (e) {
+        console.warn('[music] Spotify Mix:', (e as Error).message);
+      }
+      const fromSpotify = fresh(mix.map((t) => ({ track: t, artist: t.info.author ?? '', title: t.info.title ?? '' })));
+      if (fromSpotify.length) {
+        pending = [...pending, ...fromSpotify];
+        source = 'Spotify';
+      } else {
+        // 2) Запасной вариант — радио исполнителя на Deezer
+        const fromDeezer = fresh((await similarTracks(seed).catch(() => [])).sort(() => Math.random() - 0.5));
+        if (fromDeezer.length) {
+          pending = [...pending, ...fromDeezer];
+          source = 'Deezer';
+        }
+      }
+    }
+
+    let added = 0;
+    while (pending.length && added < count && player.get('radio') && manager.getPlayer(gid)) {
+      const c = pending.shift()!;
+      const key = trackKey(c.artist, c.title);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let tr = c.track;
+      if (!tr) {
+        // Трек из Deezer — ищем его на SoundCloud
+        const res = await loadTracks(`scsearch:${c.artist} ${c.title}`, RADIO_REQUESTER);
+        tr = res.tracks.find((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS);
+        await sleep(250);
+      }
+      if (!tr) continue;
+      await player.queue.add(tr);
+      added++;
+      if (!player.playing && !player.paused && !player.queue.current) await player.play();
+    }
+
+    player.set('radioPending', pending.slice(0, 100));
+    player.set('radioPlayed', [...seen].slice(-300));
+    player.set('radioSource', source);
+    if (added) {
+      console.log(`[music] Радио (${source || '—'}): добавлено ${added}`);
+      await refreshPanel(player);
+    }
+    return added;
+  } catch (e) {
+    console.warn('[music] Радио:', (e as Error).message);
+    return 0;
+  } finally {
+    radioBusy.delete(gid);
+  }
+}
+
+async function toggleRadio(player: Player): Promise<boolean> {
+  const on = !player.get('radio');
+  player.set('radio', on);
+  if (on) {
+    if (player.queue.current) player.set('radioSeed', player.queue.current);
+    player.set('radioPending', []);
+    void radioFill(player);
+  }
+  return on;
 }
 
 // ───────────────────────── UI ─────────────────────────
@@ -514,7 +713,13 @@ function panelPayload(player: Player) {
     .setFooter({ text: `В очереди: ${player.queue.tracks.length} • DJ-режим: ${djModeOn() ? 'вкл' : 'выкл'}` });
   if (info.uri?.startsWith('http')) embed.setURL(info.uri);
   if (info.artworkUrl) embed.setThumbnail(info.artworkUrl);
-  if (requester) embed.addFields({ name: 'Заказал', value: `<@${requester}>`, inline: true });
+  if (requester) {
+    embed.addFields({ name: 'Заказал', value: requester === RADIO_REQUESTER.id ? '📻 Радио' : `<@${requester}>`, inline: true });
+  }
+  if (player.get('radio')) {
+    const src = player.get('radioSource');
+    embed.addFields({ name: 'Радио', value: `📻 вкл${src ? ` · подбор ${src}` : ''}`, inline: true });
+  }
   if (next) embed.addFields({ name: 'Дальше', value: next });
 
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -528,6 +733,7 @@ function panelPayload(player: Player) {
     btn('voldown', '🔉'),
     btn('volup', '🔊'),
     btn('queue', '📜'),
+    btn('radio', '📻', player.get('radio') ? ButtonStyle.Success : ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, row2] };
 }

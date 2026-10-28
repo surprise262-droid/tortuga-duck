@@ -188,11 +188,15 @@ async function runCategory(
   let posted = 0;
   for (const { feedKey, item } of fresh.slice(0, config.newsMaxPerRun)) {
     try {
-      // Для Telegram-постов фото надёжнее брать прямо из Telegram
+      // Для Telegram-постов фото и видео надёжнее брать прямо из Telegram
+      let videoUrl: string | undefined;
       if (item.link && /^https?:\/\/t\.me\//i.test(item.link)) {
-        item.image = (await telegramImage(item.link)) ?? item.image;
+        const media = await telegramMedia(item.link);
+        item.image = media.image ?? item.image;
+        videoUrl = media.videoUrl;
       }
-      await channel.send({ embeds: [toEmbed(item, cat)] });
+      // Ссылку на видео отправляем текстом — Discord сам покажет под ней плеер
+      await channel.send({ content: videoUrl ? `▶️ ${videoUrl}` : undefined, embeds: [toEmbed(item, cat)] });
       seen.add(feedKey, item.guid);
       posted++;
     } catch (e) {
@@ -284,25 +288,48 @@ function pickImage(it: any): string | undefined {
   );
 }
 
+const VIDEO_HOSTS = /(youtube\.com|youtu\.be|fxtwitter\.com|fixupx\.com|vxtwitter\.com|twitter\.com|x\.com|tiktok\.com|rutube\.ru|vkvideo\.ru|vk\.com\/video)/i;
+
 /**
- * Запасной вариант для Telegram: открываем встраиваемую версию поста (t.me/канал/123?embed=1)
- * и берём из неё фото поста.
+ * Медиа из Telegram-поста: открываем встраиваемую версию (t.me/канал/123?embed=1).
+ *  • image — фото поста, кадр из видео или картинка превью ссылки;
+ *  • videoUrl — ссылка на видео из превью (YouTube, Twitter/FxTwitter…): Discord покажет её с плеером.
  */
-async function telegramImage(link: string): Promise<string | undefined> {
+async function telegramMedia(link: string): Promise<{ image?: string; videoUrl?: string }> {
   const m = link.match(/^https?:\/\/t\.me\/(?:s\/)?([\w\d_]+)\/(\d+)/i);
-  if (!m) return undefined;
+  if (!m) return {};
   try {
     const res = await fetch(`https://t.me/${m[1]}/${m[2]}?embed=1&mode=tme`, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TortugaDuckBot/1.0)' },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return undefined;
+    if (!res.ok) return {};
     const html = await res.text();
-    const photo = html.match(/tgme_widget_message_(?:photo_wrap|video_thumb)[^>]*background-image:\s*url\(['"]?([^'")]+)/i)?.[1];
-    return absUrl(photo);
+    const bg = (cls: string) =>
+      absUrl(html.match(new RegExp(`${cls}[^>]*background-image:\\s*url\\(['"]?([^'")]+)`, 'i'))?.[1]);
+    const image =
+      bg('tgme_widget_message_photo_wrap') ??
+      bg('tgme_widget_message_video_thumb') ??
+      bg('link_preview_image') ??
+      bg('link_preview_right_image');
+    const preview = html.match(/class="tgme_widget_message_link_preview"[^>]*href="([^"]+)"/i)?.[1]
+      ?? html.match(/href="([^"]+)"[^>]*class="tgme_widget_message_link_preview"/i)?.[1];
+    const previewUrl = absUrl(preview);
+    return { image, videoUrl: previewUrl && VIDEO_HOSTS.test(previewUrl) ? previewUrl : undefined };
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+/** Убираем из Telegram-текста служебный хвост вроде «📎 Подписаться на Новости» */
+function cleanTelegramText(text?: string): string | undefined {
+  const cleaned = text
+    ?.split('\n')
+    .filter((line) => !/подписаться на|подпишись на|subscribe/i.test(line))
+    .join('\n')
+    .replace(/[📎🗞️🔗\s]+$/u, '')
+    .trim();
+  return cleaned || undefined;
 }
 
 async function fetchRss(src: FeedSource): Promise<NewsItem[]> {
@@ -316,7 +343,7 @@ async function fetchRss(src: FeedSource): Promise<NewsItem[]> {
       title: it.title ?? 'Без заголовка',
       link: it.link,
       // У Telegram-постов убираем цитату, на которую отвечает пост
-      text: (isTelegram ? htmlToText(withoutQuotes(html)) : undefined) ?? it.contentSnippet ?? it.summary,
+      text: (isTelegram ? cleanTelegramText(htmlToText(withoutQuotes(html))) : undefined) ?? it.contentSnippet ?? it.summary,
       image: pickImage(it),
       date,
       source: src.name,
