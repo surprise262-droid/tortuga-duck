@@ -18,14 +18,15 @@
     "title": "🍥 Аниме",
     "color": "#EB459E",
     "feeds": [
-      { "name": "AniMoll (Telegram)", "url": "http://rsshub:1200/telegram/channel/animolll" }
+      { "name": "Anime Tarakans (Telegram)", "url": "http://rsshub:1200/telegram/channel/animetarakans" }
     ]
   },
   "free": {
     "title": "🎁 Халява",
     "color": "#57F287",
     "feeds": [
-      { "name": "GamerPower", "type": "gamerpower", "url": "https://www.gamerpower.com/api/giveaways?type=game&platform=pc" }
+      { "name": "Steam", "type": "gamerpower", "url": "https://www.gamerpower.com/api/giveaways?type=game&platform=steam" },
+      { "name": "Epic Games Store", "type": "gamerpower", "url": "https://www.gamerpower.com/api/giveaways?type=game&platform=epic-games-store" }
     ]
   }
 }

@@ -6,6 +6,7 @@ import {
   Events,
   MessageFlags,
   ModalBuilder,
+  OverwriteType,
   PermissionFlagsBits,
   TextInputBuilder,
   TextInputStyle,
@@ -192,15 +193,63 @@ export async function postControlPanel(guild: Guild, channelId: string) {
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       b('transfer', 'Передать', '👑'),
       b('claim', 'Забрать', '🏴'),
+      b('info', 'Статус', 'ℹ️', ButtonStyle.Primary),
     ),
   ];
   await channel.send({ embeds: [embed], components: rows });
 }
 
-/** Роли, через которые «все» видят/заходят в канал: @everyone и базовая роль. */
-function publicTargets(guild: Guild): string[] {
+/**
+ * Все роли, через которые люди могут видеть/заходить в канал: @everyone, базовая роль
+ * и любые роли с правами в самом канале или в его категории. Роли бота не трогаем.
+ */
+function roleTargets(channel: VoiceChannel): string[] {
+  const guild = channel.guild;
+  const botRoles = new Set(guild.members.me?.roles.cache.keys() ?? []);
+  const ids = new Set<string>([guild.roles.everyone.id]);
   const base = getSetting('role.base');
-  return [guild.roles.everyone.id, ...(base ? [base] : [])];
+  if (base) ids.add(base);
+  const collect = (cache: any) => {
+    for (const ow of cache?.values?.() ?? []) if (ow.type === OverwriteType.Role) ids.add(ow.id);
+  };
+  collect(channel.permissionOverwrites.cache);
+  collect(channel.parent?.permissionOverwrites.cache);
+  return [...ids].filter((id) => !botRoles.has(id) || id === guild.roles.everyone.id);
+}
+
+/** Значение права в категории для роли: true / false / null (не задано) — чтобы «открыть» вернуло как было. */
+function parentValue(channel: VoiceChannel, roleId: string, perm: 'Connect' | 'ViewChannel'): boolean | null {
+  const ow = channel.parent?.permissionOverwrites.cache.get(roleId);
+  if (!ow) return null;
+  if (ow.allow.has(perm)) return true;
+  if (ow.deny.has(perm)) return false;
+  return null;
+}
+
+async function restrict(channel: VoiceChannel, perm: 'Connect' | 'ViewChannel') {
+  for (const id of roleTargets(channel)) await channel.permissionOverwrites.edit(id, { [perm]: false });
+}
+
+async function restore(channel: VoiceChannel, perm: 'Connect' | 'ViewChannel') {
+  for (const id of roleTargets(channel)) await channel.permissionOverwrites.edit(id, { [perm]: parentValue(channel, id, perm) });
+}
+
+function statusText(channel: VoiceChannel, row: PvcRow): string {
+  const everyone = channel.permissionOverwrites.cache.get(channel.guild.roles.everyone.id);
+  const locked = !!everyone?.deny.has('Connect');
+  const hidden = !!everyone?.deny.has('ViewChannel');
+  const members = [...channel.permissionOverwrites.cache.values()].filter((o) => o.type === OverwriteType.Member && o.id !== row.owner_id);
+  const allowed = members.filter((o) => o.allow.has('Connect')).map((o) => `<@${o.id}>`);
+  const banned = members.filter((o) => o.deny.has('Connect')).map((o) => `<@${o.id}>`);
+  return [
+    `👑 Владелец: <@${row.owner_id}>`,
+    `👥 Лимит: ${channel.userLimit ? channel.userLimit : 'без лимита'}`,
+    `${locked ? '🔒 Закрыт' : '🔓 Открыт'} · ${hidden ? '🙈 Скрыт' : '👁 Виден всем'}`,
+    `✅ Пущены: ${allowed.join(', ') || '—'}`,
+    `🚫 Выгнаны: ${banned.join(', ') || '—'}`,
+    '',
+    '*Администраторы сервера видят и заходят в любые каналы — запреты Discord на них не действуют.*',
+  ].join('\n');
 }
 
 async function ownedChannel(i: ComponentInteraction): Promise<{ channel: VoiceChannel; row: PvcRow } | string> {
@@ -208,7 +257,7 @@ async function ownedChannel(i: ComponentInteraction): Promise<{ channel: VoiceCh
   const vc = i.member.voice.channel;
   const row = vc ? q.get(vc.id) : undefined;
   if (!vc || !row) return '🔊 Сначала зайди в свой приватный канал.';
-  if (row.owner_id !== i.user.id && i.customId !== 'pvc:claim') return '👑 Это не твой канал — управлять им может только владелец.';
+  if (row.owner_id !== i.user.id && !['pvc:claim', 'pvc:info'].includes(i.customId)) return '👑 Это не твой канал — управлять им может только владелец.';
   return { channel: vc as VoiceChannel, row };
 }
 
@@ -252,7 +301,8 @@ export async function onComponent(i: ComponentInteraction) {
   if (i.isUserSelectMenu()) {
     const targetId = i.values[0];
     if (!targetId) return respond(i, 'Никто не выбран.');
-    if (targetId === i.user.id) return respond(i, '🦆 Это ты.');
+    if (targetId === i.user.id) return i.update({ content: '🦆 Это ты.', components: [] });
+    if (i.users.get(targetId)?.bot) return i.update({ content: '🤖 Ботов выбирать нельзя.', components: [] });
     if (sub === 'permit') {
       await channel.permissionOverwrites.edit(targetId, { ViewChannel: true, Connect: true });
       return i.update({ content: `✅ <@${targetId}> может заходить.`, components: [] });
@@ -310,22 +360,26 @@ export async function onComponent(i: ComponentInteraction) {
       );
     case 'lock':
       return safely(i, async () => {
-        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: false });
-        return '🔒 Канал закрыт. Зайти смогут только те, кого ты пустишь (✅).';
+        await restrict(channel, 'Connect');
+        return '🔒 Канал закрыт. Зайти смогут только те, кого ты пустишь (✅). Кто уже внутри — остаётся.';
       });
     case 'unlock':
       return safely(i, async () => {
-        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { Connect: null });
+        await restore(channel, 'Connect');
         return '🔓 Канал открыт для всех.';
       });
     case 'hide':
       return safely(i, async () => {
-        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: false });
-        return '🙈 Канал скрыт из списка.';
+        // Тем, кто уже сидит в канале, оставляем доступ — иначе они «потеряют» канал
+        for (const m of channel.members.values()) {
+          if (!m.user.bot && m.id !== row.owner_id) await channel.permissionOverwrites.edit(m.id, { ViewChannel: true, Connect: true });
+        }
+        await restrict(channel, 'ViewChannel');
+        return '🙈 Канал скрыт из списка. Его видят только те, кто внутри, и кого ты пустишь (✅).';
       });
     case 'show':
       return safely(i, async () => {
-        for (const id of publicTargets(guild)) await channel.permissionOverwrites.edit(id, { ViewChannel: null });
+        await restore(channel, 'ViewChannel');
         return '👁 Канал снова виден всем.';
       });
     case 'permit':
@@ -339,6 +393,8 @@ export async function onComponent(i: ComponentInteraction) {
       const menu = new UserSelectMenuBuilder().setCustomId(`pvc:select:${action}`).setPlaceholder('Выбери участника').setMaxValues(1);
       return respond(i, { content: titles[action], components: [new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(menu)] });
     }
+    case 'info':
+      return respond(i, { embeds: [baseEmbed().setTitle(`ℹ️ ${channel.name}`).setDescription(statusText(channel, row))] });
     case 'claim': {
       if (row.owner_id === i.user.id) return respond(i, '👑 Канал и так твой.');
       if (channel.members.has(row.owner_id)) return respond(i, '👑 Владелец ещё здесь — попроси его передать права.');
