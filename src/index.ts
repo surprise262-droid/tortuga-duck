@@ -50,6 +50,10 @@ client.on(Events.InteractionCreate, async (i) => {
       await commandOwners.get(i.commandName)?.onCommand?.(i);
       return;
     }
+    if (i.isAutocomplete()) {
+      await commandOwners.get(i.commandName)?.onAutocomplete?.(i);
+      return;
+    }
     if (i.isMessageComponent() || i.isModalSubmit()) {
       const prefix = i.customId.split(':')[0];
       const owner = modules.find((m) => m.componentPrefix === prefix);

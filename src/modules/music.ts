@@ -5,6 +5,7 @@ import {
   Events,
   GuildMember,
   SlashCommandBuilder,
+  type AutocompleteInteraction,
   type ChatInputCommandInteraction,
   type Client,
   type Guild,
@@ -36,7 +37,9 @@ export const commands = [
   new SlashCommandBuilder()
     .setName('play')
     .setDescription('Включить трек или плейлист: название, ссылка SoundCloud/Spotify/Bandcamp или радио')
-    .addStringOption((o) => o.setName('query').setDescription('Название или ссылка').setRequired(true)),
+    .addStringOption((o) =>
+      o.setName('query').setDescription('Начни вводить название — появятся варианты').setRequired(true).setAutocomplete(true),
+    ),
   new SlashCommandBuilder()
     .setName('play_file')
     .setDescription('Включить свой аудиофайл (MP3, OGG, WAV, M4A, FLAC)')
@@ -292,6 +295,48 @@ async function searchByText(text: string, requester: unknown): Promise<LoadResul
     last = res;
   }
   return last;
+}
+
+// ───────────────────────── подсказки при вводе /play ─────────────────────────
+
+/** Кэш подсказок: запрос → варианты (Discord шлёт запрос почти на каждую букву) */
+const suggestCache = new Map<string, { at: number; choices: { name: string; value: string }[] }>();
+const SUGGEST_TTL_MS = 5 * 60_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+}
+
+export async function onAutocomplete(i: AutocompleteInteraction) {
+  if (i.commandName !== 'play') return;
+  const typed = i.options.getFocused().trim();
+  const asTyped = typed ? [{ name: `🔍 Искать: ${truncate(typed, 85)}`, value: typed.slice(0, 100) }] : [];
+
+  // Ссылки и слишком короткие запросы не ищем — просто подставляем как есть
+  if (typed.length < 3 || /^https?:\/\//i.test(typed)) return i.respond(asTyped).catch(() => {});
+
+  const key = typed.toLowerCase();
+  const cached = suggestCache.get(key);
+  if (cached && Date.now() - cached.at < SUGGEST_TTL_MS) return i.respond(cached.choices).catch(() => {});
+
+  // У Discord на ответ 3 секунды — ждём поиск не дольше 2,3 сек
+  const res = await withTimeout(loadTracks(`scsearch:${typed}`, null), 2300);
+  const found = (res?.tracks ?? [])
+    .filter((t) => t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS)
+    .slice(0, 15)
+    .map((t) => {
+      const name = `${t.info.author ? `${t.info.author} — ` : ''}${t.info.title} (${t.info.isStream ? 'эфир' : formatDuration(t.info.duration)})`;
+      // Ссылка на трек — чтобы включился именно выбранный вариант (лимит Discord — 100 символов)
+      const value = t.info.uri && t.info.uri.length <= 100 ? t.info.uri : `${t.info.author ?? ''} ${t.info.title}`.trim();
+      return { name: truncate(name, 100), value: value.slice(0, 100) };
+    });
+
+  const choices = [...asTyped, ...found].slice(0, 25);
+  if (res) {
+    suggestCache.set(key, { at: Date.now(), choices });
+    if (suggestCache.size > 500) suggestCache.delete(suggestCache.keys().next().value as string);
+  }
+  return i.respond(choices).catch(() => {});
 }
 
 /** Общая часть /play и /play_file: проверка голосового, плеер, очередь. */

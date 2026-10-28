@@ -16,4 +16,5 @@ RUN mkdir /out \
  && ls -la /out
 
 FROM ghcr.io/lavalink-devs/lavalink:4
+# Lavalink работает под пользователем 322 — ему нужно право писать в plugins/ (туда же скачивается LavaSrc)
 COPY --from=soundy --chown=322:322 /out/ /opt/Lavalink/plugins/

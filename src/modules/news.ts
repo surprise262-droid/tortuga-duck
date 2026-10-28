@@ -2,6 +2,7 @@ import Parser from 'rss-parser';
 import {
   EmbedBuilder,
   Events,
+  MessageFlags,
   PermissionFlagsBits,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
@@ -9,7 +10,7 @@ import {
 } from 'discord.js';
 import { config } from '../config';
 import { db, getSetting } from '../db';
-import { hexToInt, readConfigJson, respond, truncate } from '../util';
+import { hexToInt, readConfigJson, truncate } from '../util';
 
 interface FeedSource {
   name: string;
@@ -71,13 +72,23 @@ export function setup(client: Client) {
 }
 
 export async function onCommand(i: ChatInputCommandInteraction) {
-  await respond(i, '📰 Проверяю ленты… Новые посты появятся в каналах новостей.');
-  const posted = await runAll(i.client);
-  await respond(i, posted >= 0 ? `📰 Готово. Опубликовано: ${posted}.` : '⏳ Проверка уже идёт, подожди немного.');
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const report: string[] = [];
+  const posted = await runAll(i.client, report);
+  if (posted < 0) return i.editReply('⏳ Проверка уже идёт, подожди минуту и повтори.');
+  const embed = new EmbedBuilder()
+    .setColor(config.color)
+    .setTitle(`📰 Проверка новостей — опубликовано: ${posted}`)
+    .setDescription(truncate(report.join('\n') || 'Ни одной категории не назначен канал. Используй `/setup channel`.', 4000))
+    .setFooter({ text: 'Новые посты появляются по мере выхода статей. «новых 0» — значит, свежего пока ничего нет.' });
+  return i.editReply({ embeds: [embed] });
 }
 
-/** Проверяет все категории. Возвращает число опубликованных новостей (или -1, если проверка уже идёт). */
-async function runAll(client: Client): Promise<number> {
+/**
+ * Проверяет все категории. Возвращает число опубликованных новостей (или -1, если проверка уже идёт).
+ * Если передан report — пишет туда строку о состоянии каждого источника.
+ */
+async function runAll(client: Client, report?: string[]): Promise<number> {
   if (running) return -1;
   running = true;
   let total = 0;
@@ -85,19 +96,45 @@ async function runAll(client: Client): Promise<number> {
     const feeds = readConfigJson<FeedsConfig>('feeds.json', {});
     for (const [key, cat] of Object.entries(feeds)) {
       const channelId = getSetting(`channel.news_${key}`);
-      if (!channelId) continue;
-      total += await runCategory(client, key, cat, channelId);
+      if (!channelId) {
+        report?.push(`**${cat.title}** — ⚪ канал не назначен`);
+        continue;
+      }
+      total += await runCategory(client, key, cat, channelId, report);
     }
   } finally {
     running = false;
   }
+  if (total > 0) console.log(`[news] Опубликовано новостей: ${total}`);
   return total;
 }
 
-async function runCategory(client: Client, key: string, cat: Category, channelId: string): Promise<number> {
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel?.isTextBased() || !('send' in channel)) return 0;
+async function runCategory(
+  client: Client,
+  key: string,
+  cat: Category,
+  channelId: string,
+  report?: string[],
+): Promise<number> {
+  const channel = await client.channels.fetch(channelId).catch((e) => {
+    console.warn(`[news] ${cat.title}: не открыть канал ${channelId}: ${e?.message}`);
+    return null;
+  });
+  if (!channel?.isTextBased() || !('send' in channel)) {
+    report?.push(`**${cat.title}** — ❌ бот не видит канал <#${channelId}>. Дай роли Tortuga Duck доступ к нему.`);
+    return 0;
+  }
+  if ('permissionsFor' in channel && client.user) {
+    const perms = (channel as any).permissionsFor(client.user);
+    const missing = ['ViewChannel', 'SendMessages', 'EmbedLinks'].filter((p) => !perms?.has(p));
+    if (missing.length) {
+      report?.push(`**${cat.title}** — ❌ в <#${channelId}> боту не хватает прав: ${missing.join(', ')}`);
+      console.warn(`[news] ${cat.title}: нет прав ${missing.join(', ')} в канале ${channelId}`);
+      return 0;
+    }
+  }
 
+  report?.push(`**${cat.title}** → <#${channelId}>`);
   const fresh: { feedKey: string; item: NewsItem }[] = [];
   for (const src of cat.feeds) {
     const feedKey = `${key}:${src.url}`;
@@ -105,7 +142,9 @@ async function runCategory(client: Client, key: string, cat: Category, channelId
     try {
       items = src.type === 'gamerpower' ? await fetchGamerPower(src) : await fetchRss(src);
     } catch (e) {
-      console.warn(`[news] ${src.name}: ${(e as Error).message}`);
+      const msg = (e as Error).message;
+      console.warn(`[news] ${src.name}: ${msg}`);
+      report?.push(`  • ${src.name}: ❌ ${truncate(msg, 120)}`);
       continue;
     }
 
@@ -114,9 +153,11 @@ async function runCategory(client: Client, key: string, cat: Category, channelId
       const sorted = [...items].sort((a, b) => b.date - a.date);
       sorted.slice(1).forEach((it) => seen.add(feedKey, it.guid));
       if (sorted[0]) fresh.push({ feedKey, item: sorted[0] });
+      report?.push(`  • ${src.name}: ✅ ${items.length} записей, первый запуск — публикую самую свежую`);
       continue;
     }
 
+    let fresh1 = 0;
     for (const it of items) {
       if (seen.has(feedKey, it.guid)) continue;
       if (Date.now() - it.date > MAX_AGE_MS && src.type !== 'gamerpower') {
@@ -124,7 +165,9 @@ async function runCategory(client: Client, key: string, cat: Category, channelId
         continue;
       }
       fresh.push({ feedKey, item: it });
+      fresh1++;
     }
+    report?.push(`  • ${src.name}: ✅ ${items.length} записей, новых ${fresh1}`);
   }
 
   // От старых к новым, не больше лимита за проход — остальные дождутся следующей проверки
@@ -136,8 +179,13 @@ async function runCategory(client: Client, key: string, cat: Category, channelId
       seen.add(feedKey, item.guid);
       posted++;
     } catch (e) {
-      console.warn(`[news] Не удалось отправить «${item.title}»:`, (e as Error).message);
+      const msg = (e as Error).message;
+      console.warn(`[news] Не удалось отправить «${item.title}»:`, msg);
+      report?.push(`  • ❌ не отправилось «${truncate(item.title, 60)}»: ${truncate(msg, 100)}`);
     }
+  }
+  if (fresh.length > config.newsMaxPerRun) {
+    report?.push(`  • ещё ${fresh.length - config.newsMaxPerRun} в очереди — выйдут в следующие проверки`);
   }
   return posted;
 }

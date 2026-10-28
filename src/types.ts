@@ -1,4 +1,5 @@
 import type {
+  AutocompleteInteraction,
   ChatInputCommandInteraction,
   Client,
   MessageComponentInteraction,
@@ -13,6 +14,8 @@ export interface BotModule {
   /** Префикс customId кнопок/меню/модалок модуля, например "music" → "music:skip" */
   componentPrefix?: string;
   onCommand?(i: ChatInputCommandInteraction): Promise<unknown>;
+  /** Подсказки при вводе параметра команды */
+  onAutocomplete?(i: AutocompleteInteraction): Promise<unknown>;
   onComponent?(i: ComponentInteraction): Promise<unknown>;
   /** Вызывается один раз до входа бота: подписка на события, таймеры */
   setup?(client: Client): void;
