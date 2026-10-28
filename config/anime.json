@@ -1,0 +1,8 @@
+{
+  "bases": ["https://shikimori.io", "https://shikimori.one"],
+  "kinds": ["tv", "movie", "ona"],
+  "calendarDays": 120,
+  "calendarMax": 45,
+  "intervalMinutes": 60,
+  "maxPages": 10
+}

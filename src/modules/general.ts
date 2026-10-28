@@ -48,6 +48,10 @@ export async function onCommand(i: ChatInputCommandInteraction) {
         value: '`/roles` — выбрать, какие новости и каналы тебе показывать.',
       },
       {
+        name: '🍥 Аниме',
+        value: '`/anime_calendar` — ближайшие премьеры. Новые анонсы и закреплённый календарь — в канале анонсов.',
+      },
+      {
         name: '🛠 Для админов',
         value: '`/setup` — каналы и роли бота, DJ-режим. `/welcome-test`, `/news-now`, `/clear_messages`.',
       },

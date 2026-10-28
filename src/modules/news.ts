@@ -65,6 +65,19 @@ export const commands = [
 
 let running = false;
 
+/**
+ * Сбросить «уже опубликовано» для категории. Вызывается при смене канала:
+ * иначе новости, ушедшие в старый канал, в новый уже не попадут, и он будет пустым до выхода свежих статей.
+ */
+export function resetCategory(key: string) {
+  db.prepare('DELETE FROM news_seen WHERE feed LIKE ?').run(`${key}:%`);
+}
+
+/** Запустить проверку сразу (например, после /setup). */
+export function runNewsNow(client: Client) {
+  return runAll(client);
+}
+
 export function setup(client: Client) {
   client.once(Events.ClientReady, () => void runAll(client));
   setInterval(() => void runAll(client), config.newsIntervalMinutes * 60_000);
@@ -79,7 +92,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
   const embed = new EmbedBuilder()
     .setColor(config.color)
     .setTitle(`📰 Проверка новостей — опубликовано: ${posted}`)
-    .setDescription(truncate(report.join('\n') || 'Ни одной категории не назначен канал. Используй `/setup channel`.', 4000))
+    .setDescription((report.join('\n') || 'Ни одной категории не назначен канал. Используй `/setup channel`.').slice(0, 4000))
     .setFooter({ text: 'Новые посты появляются по мере выхода статей. «новых 0» — значит, свежего пока ничего нет.' });
   return i.editReply({ embeds: [embed] });
 }

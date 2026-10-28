@@ -11,7 +11,7 @@
     "title": "🎬 Кино и сериалы",
     "color": "#ED4245",
     "feeds": [
-      { "name": "КГ-Портал", "url": "https://kg-portal.ru/rss/news.rss" }
+      { "name": "Кинопоиск: скоро (Telegram)", "url": "http://rsshub:1200/telegram/channel/kinopoisk_soon" }
     ]
   },
   "anime": {

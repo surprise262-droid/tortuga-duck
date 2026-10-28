@@ -4,8 +4,10 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
 } from 'discord.js';
-import { allSettings, setSetting } from '../db';
+import { allSettings, getSetting, setSetting } from '../db';
 import { baseEmbed, respond } from '../util';
+import { resetAnimeAnnounce, runAnimeNow } from './anime';
+import { resetCategory, runNewsNow } from './news';
 import { postControlPanel } from './privateVoice';
 import { postRolesPanel } from './roles';
 
@@ -20,6 +22,7 @@ export const CHANNEL_PURPOSES: [string, string, boolean][] = [
   ['news_movies', 'Новости: кино и сериалы', false],
   ['news_anime', 'Новости: аниме', false],
   ['news_free', 'Новости: халява', false],
+  ['anime_announce', 'Аниме: анонсы и календарь', false],
 ];
 
 const ROLE_PURPOSES: [string, string][] = [
@@ -84,8 +87,20 @@ export async function onCommand(i: ChatInputCommandInteraction) {
     if (needsVoice && !isVoice) return respond(i, '❌ Для Join to Create нужен **голосовой** канал.');
     if (!needsVoice && isVoice) return respond(i, '❌ Для этой функции нужен **текстовый** канал.');
 
+    const previous = getSetting(`channel.${purpose}`);
     setSetting(`channel.${purpose}`, channel.id);
     let extra = '';
+    if (purpose.startsWith('news_') && previous !== channel.id) {
+      // Новый канал получает свежую новость от каждого источника сразу, а не ждёт новых статей
+      resetCategory(purpose.slice('news_'.length));
+      void runNewsNow(i.client);
+      extra = '\nСейчас опубликую в него по одной свежей новости от каждого источника.';
+    }
+    if (purpose === 'anime_announce' && previous !== channel.id) {
+      resetAnimeAnnounce();
+      void runAnimeNow(i.client);
+      extra = '\nСейчас создам и закреплю в нём календарь анонсов. Новые анонсы будут приходить сюда же.';
+    }
     if (purpose === 'vc_control' && i.guild) {
       await postControlPanel(i.guild, channel.id);
       extra = '\nПанель управления приватками отправлена в канал.';
