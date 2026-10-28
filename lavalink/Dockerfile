@@ -16,4 +16,4 @@ RUN mkdir /out \
  && ls -la /out
 
 FROM ghcr.io/lavalink-devs/lavalink:4
-COPY --from=soundy /out/ /opt/Lavalink/plugins/
+COPY --from=soundy --chown=322:322 /out/ /opt/Lavalink/plugins/
