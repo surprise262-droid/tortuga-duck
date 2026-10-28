@@ -188,6 +188,10 @@ async function runCategory(
   let posted = 0;
   for (const { feedKey, item } of fresh.slice(0, config.newsMaxPerRun)) {
     try {
+      // Для Telegram-постов фото надёжнее брать прямо из Telegram
+      if (item.link && /^https?:\/\/t\.me\//i.test(item.link)) {
+        item.image = (await telegramImage(item.link)) ?? item.image;
+      }
       await channel.send({ embeds: [toEmbed(item, cat)] });
       seen.add(feedKey, item.guid);
       posted++;
@@ -218,26 +222,102 @@ function toEmbed(item: NewsItem, cat: Category) {
 
 // ───────────────────────── источники ─────────────────────────
 
-function firstImgFromHtml(html?: string): string | undefined {
-  return html?.match(/<img[^>]+src=["']([^"']+)["']/i)?.[1];
+const IMG_EXT = /\.(jpe?g|png|webp|gif)(\?|$)/i;
+
+/** Абсолютный https-адрес или undefined */
+function absUrl(u?: string): string | undefined {
+  if (!u) return undefined;
+  const url = u.trim().replace(/&amp;/g, '&');
+  const full = url.startsWith('//') ? `https:${url}` : url;
+  if (!/^https?:\/\//i.test(full)) return undefined;
+  // Внутренние адреса (rsshub:1200, localhost) Discord открыть не сможет
+  try {
+    const host = new URL(full).hostname;
+    if (!host.includes('.') || host === 'localhost') return undefined;
+  } catch {
+    return undefined;
+  }
+  return full;
+}
+
+/** Все картинки из HTML: <img src> и background-image:url(...). Без эмодзи и иконок. */
+function imagesFromHtml(html?: string): string[] {
+  if (!html) return [];
+  const out: string[] = [];
+  for (const m of html.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) out.push(m[1]);
+  for (const m of html.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)) out.push(m[1]);
+  return out
+    .map(absUrl)
+    .filter((u): u is string => !!u)
+    .filter((u) => !/emoji|\/img\/(?:emoji|t_logo)|favicon|\.svg(\?|$)/i.test(u));
+}
+
+/** HTML без цитаты-ответа (<blockquote>) — в Telegram-постах там чужой текст и миниатюры */
+const withoutQuotes = (html?: string) => html?.replace(/<blockquote[\s\S]*?<\/blockquote>/gi, ' ');
+
+function htmlToText(html?: string): string | undefined {
+  if (!html) return undefined;
+  const text = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+  return text.trim() || undefined;
+}
+
+function pickImage(it: any): string | undefined {
+  const enc = it.enclosure;
+  const encImage =
+    enc?.url && (String(enc.type ?? '').startsWith('image/') || IMG_EXT.test(enc.url)) ? absUrl(enc.url) : undefined;
+  const html = it['content:encoded'] ?? it.content;
+  return (
+    encImage ??
+    absUrl(it.mediaContent?.$?.url) ??
+    absUrl(it.mediaThumbnail?.$?.url) ??
+    imagesFromHtml(withoutQuotes(html))[0] ??
+    imagesFromHtml(html)[0]
+  );
+}
+
+/**
+ * Запасной вариант для Telegram: открываем встраиваемую версию поста (t.me/канал/123?embed=1)
+ * и берём из неё фото поста.
+ */
+async function telegramImage(link: string): Promise<string | undefined> {
+  const m = link.match(/^https?:\/\/t\.me\/(?:s\/)?([\w\d_]+)\/(\d+)/i);
+  if (!m) return undefined;
+  try {
+    const res = await fetch(`https://t.me/${m[1]}/${m[2]}?embed=1&mode=tme`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TortugaDuckBot/1.0)' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return undefined;
+    const html = await res.text();
+    const photo = html.match(/tgme_widget_message_(?:photo_wrap|video_thumb)[^>]*background-image:\s*url\(['"]?([^'")]+)/i)?.[1];
+    return absUrl(photo);
+  } catch {
+    return undefined;
+  }
 }
 
 async function fetchRss(src: FeedSource): Promise<NewsItem[]> {
   const feed = await parser.parseURL(src.url);
   return (feed.items ?? []).map((it: any) => {
-    const image =
-      it.enclosure?.url ??
-      it.mediaContent?.$?.url ??
-      it.mediaThumbnail?.$?.url ??
-      firstImgFromHtml(it.content) ??
-      firstImgFromHtml(it['content:encoded']);
     const date = Date.parse(it.isoDate ?? it.pubDate ?? '') || Date.now();
+    const html = it['content:encoded'] ?? it.content;
+    const isTelegram = /^https?:\/\/t\.me\//i.test(it.link ?? '');
     return {
       guid: String(it.guid ?? it.link ?? it.title),
       title: it.title ?? 'Без заголовка',
       link: it.link,
-      text: it.contentSnippet ?? it.summary,
-      image,
+      // У Telegram-постов убираем цитату, на которую отвечает пост
+      text: (isTelegram ? htmlToText(withoutQuotes(html)) : undefined) ?? it.contentSnippet ?? it.summary,
+      image: pickImage(it),
       date,
       source: src.name,
     };
