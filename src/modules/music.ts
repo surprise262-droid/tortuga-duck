@@ -17,7 +17,7 @@ import {
 } from 'discord.js';
 import { LavalinkManager, type Player, type Track } from 'lavalink-client';
 import { config } from '../config';
-import { db, getSetting } from '../db';
+import { db, getSetting, setSetting } from '../db';
 import type { ComponentInteraction } from '../types';
 import { baseEmbed, formatDuration, isManager, respond, truncate } from '../util';
 
@@ -223,7 +223,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
     case 'nowplaying':
       if (!player?.queue.current) return respond(i, '🎵 Сейчас ничего не играет.');
       await respond(i, '👌 Плеер обновлён.');
-      return showPanel(i.client, player, true, i.channelId);
+      return showPanel(i.client, player, true, i.channelId, true);
   }
 
   const err = checkControl(member, player, i.commandName);
@@ -233,34 +233,34 @@ export async function onCommand(i: ChatInputCommandInteraction) {
   switch (i.commandName) {
     case 'skip':
       await skip(p);
-      return respond(i, '⏭ Пропущено.', false);
+      return respond(i, '⏭ Пропущено.');
     case 'pause':
       if (!p.paused) await p.pause();
       await refreshPanel(p);
-      return respond(i, '⏸ Пауза.', false);
+      return respond(i, '⏸ Пауза.');
     case 'resume':
       if (p.paused) await p.resume();
       await refreshPanel(p);
-      return respond(i, '▶️ Играем дальше.', false);
+      return respond(i, '▶️ Играем дальше.');
     case 'stop':
       await p.destroy('stop');
-      return respond(i, '⏹ Музыка остановлена, очередь очищена.', false);
+      return respond(i, '⏹ Музыка остановлена, очередь очищена.');
     case 'volume': {
       const level = i.options.getInteger('level', true);
       await p.setVolume(level);
       await refreshPanel(p);
-      return respond(i, `🔊 Громкость: **${level}%**`, false);
+      return respond(i, `🔊 Громкость: **${level}%**`);
     }
     case 'shuffle': {
       const on = toggleShuffle(p);
       await refreshPanel(p);
-      return respond(i, on ? '🔀 Перемешивание **включено**.' : '➡️ Играем **по порядку**.', false);
+      return respond(i, on ? '🔀 Перемешивание **включено**.' : '➡️ Играем **по порядку**.');
     }
     case 'loop': {
       const mode = i.options.getString('mode', true) as 'off' | 'track' | 'queue';
       await p.setRepeatMode(mode);
       await refreshPanel(p);
-      return respond(i, `🔁 Повтор: **${repeatLabel(mode)}**`, false);
+      return respond(i, `🔁 Повтор: **${repeatLabel(mode)}**`);
     }
     case 'radio': {
       const on = await toggleRadio(p);
@@ -268,7 +268,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       return respond(
         i,
         on ? '📻 Радио **включено** — подбираю похожие треки.' : '📻 Радио **выключено**.',
-        false,
+        true,
       );
     }
     case 'remove': {
@@ -276,7 +276,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       if (pos > p.queue.tracks.length) return respond(i, `❌ В очереди всего ${p.queue.tracks.length} треков.`);
       const [removed] = await p.queue.splice(pos - 1, 1);
       await refreshPanel(p);
-      return respond(i, `🗑 Убран: **${(removed as any)?.info?.title ?? 'трек'}**`, false);
+      return respond(i, `🗑 Убран: **${(removed as any)?.info?.title ?? 'трек'}**`);
     }
   }
 }
@@ -1060,37 +1060,76 @@ async function getTextChannel(client: Client, player: Player, override?: string)
   return ch?.isTextBased() ? (ch as TextBasedChannel) : null;
 }
 
-/** Показывает плеер внизу канала (старый удаляется), запускает обновление прогресса. */
-async function showPanel(client: Client, player: Player, playing: boolean, channelOverride?: string) {
-  const guildId = player.guildId;
-  const old = panels.get(guildId);
-  if (old) await old.delete().catch(() => {});
-  panels.delete(guildId);
-  stopProgress(guildId);
-
-  const channel = await getTextChannel(client, player, channelOverride);
-  if (!channel || !('send' in channel)) return;
-  const msg = await channel.send(panelPayload(player)).catch((e) => {
-    console.warn('[music] Не удалось отправить плеер:', e?.message);
-    return null;
-  });
-  if (!msg) return;
-  panels.set(guildId, msg);
-
-  if (playing) {
-    progressTimers.set(
-      guildId,
-      setInterval(() => void refreshPanel(player), 15_000),
-    );
-  }
+/** Очередь операций с плеером по серверу — чтобы два события подряд не создали два сообщения */
+const panelLocks = new Map<string, Promise<unknown>>();
+function withPanelLock<T>(guildId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = panelLocks.get(guildId) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  panelLocks.set(guildId, next);
+  return next;
 }
 
-async function refreshPanel(player: Player) {
-  const msg = panels.get(player.guildId);
-  if (!msg) return;
-  await msg.edit(panelPayload(player)).catch(() => {
-    panels.delete(player.guildId);
-    stopProgress(player.guildId);
+const panelKey = (guildId: string) => `music.panel.${guildId}`;
+
+/** Достаём сообщение-плеер: из памяти или по id, сохранённому в базе (переживает перезапуск бота) */
+async function findPanel(client: Client, guildId: string): Promise<Message | null> {
+  const cached = panels.get(guildId);
+  if (cached) return cached;
+  const saved = getSetting(panelKey(guildId));
+  if (!saved) return null;
+  const [channelId, messageId] = saved.split(':');
+  const ch: any = await client.channels.fetch(channelId).catch(() => null);
+  const msg: Message | null = ch?.messages ? await ch.messages.fetch(messageId).catch(() => null) : null;
+  if (msg) panels.set(guildId, msg);
+  else setSetting(panelKey(guildId), null);
+  return msg;
+}
+
+/**
+ * Показывает плеер. Обычно ОБНОВЛЯЕТ одно и то же сообщение (без флуда).
+ * Новое сообщение внизу канала — только если старого нет или вызвали /nowplaying (moveToBottom).
+ */
+function showPanel(client: Client, player: Player, playing: boolean, channelOverride?: string, moveToBottom = false) {
+  return withPanelLock(player.guildId, async () => {
+    const guildId = player.guildId;
+    const channel = await getTextChannel(client, player, channelOverride);
+    if (!channel || !('send' in channel)) return;
+
+    let msg = await findPanel(client, guildId);
+    if (msg && (moveToBottom || msg.channelId !== channel.id)) {
+      await msg.delete().catch(() => {});
+      msg = null;
+      panels.delete(guildId);
+    }
+
+    if (msg) {
+      const ok = await msg.edit(panelPayload(player)).then(() => true).catch(() => false);
+      if (!ok) msg = null;
+    }
+    if (!msg) {
+      msg = await channel.send(panelPayload(player)).catch((e) => {
+        console.warn('[music] Не удалось отправить плеер:', e?.message);
+        return null;
+      });
+      if (!msg) return;
+      panels.set(guildId, msg);
+      setSetting(panelKey(guildId), `${msg.channelId}:${msg.id}`);
+    }
+
+    stopProgress(guildId);
+    if (playing) progressTimers.set(guildId, setInterval(() => void refreshPanel(player), 15_000));
+  });
+}
+
+function refreshPanel(player: Player) {
+  return withPanelLock(player.guildId, async () => {
+    const msg = panels.get(player.guildId);
+    if (!msg) return;
+    await msg.edit(panelPayload(player)).catch(() => {
+      panels.delete(player.guildId);
+      setSetting(panelKey(player.guildId), null);
+      stopProgress(player.guildId);
+    });
   });
 }
 
@@ -1100,15 +1139,16 @@ function stopProgress(guildId: string) {
   progressTimers.delete(guildId);
 }
 
-async function closePanel(guildId: string) {
+/** Музыка остановлена: то же сообщение превращается в «бар закрыт» и будет переиспользовано при следующем /play */
+function closePanel(guildId: string) {
   stopProgress(guildId);
-  const msg = panels.get(guildId);
-  panels.delete(guildId);
-  if (msg) {
+  return withPanelLock(guildId, async () => {
+    const msg = panels.get(guildId);
+    if (!msg) return;
     await msg
       .edit({ embeds: [baseEmbed().setTitle('🦆 Музыка остановлена').setDescription('Бар закрыт до следующего `/play`.')], components: [] })
       .catch(() => {});
-  }
+  });
 }
 
 async function notify(client: Client, player: Player, text: string) {
