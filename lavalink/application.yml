@@ -56,6 +56,8 @@ plugins:
       customTokenEndpoint: "http://spotify-tokener:8080/api/token"
       # Меньше запросов к Spotify при поиске (рекомендация автора LavaSrc)
       resolveArtistsInSearch: false
+      # Поиск через внутренний API веб-плеера Spotify. Публичный v1-поиск Spotify урезал в 2026 году,
+      # с анонимным токеном он отвечает ошибкой — без этого не работают радио и поиск по ISRC.
       preferPartnerApi: true
       countryCode: "US"
       playlistLoadLimit: 6   # страниц по 100 треков

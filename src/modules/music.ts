@@ -102,6 +102,7 @@ export function setup(client: Client) {
       defaultSearchPlatform: 'scsearch',
       onDisconnect: { autoReconnect: true, destroyPlayer: false },
       onEmptyQueue: { destroyAfterMs: 5 * 60_000 },
+      maxErrorsPerTime: { threshold: 10_000, maxAmount: 25 },
       requesterTransformer: (r: any) => ({ id: r?.id, username: r?.username }),
     },
     queueOptions: { maxPreviousTracks: 10 },
@@ -123,14 +124,20 @@ export function setup(client: Client) {
     } catch (e) {
       console.warn('[music] Статистика:', (e as Error).message);
     }
-    if (player.get('radio')) {
-      player.set('radioSeed', track);
-      if (player.queue.tracks.length < 3) void radioFill(player);
-    }
+    if (player.get('radio')) player.set('radioSeed', track);
+    void topUp(player).then(() => {
+      if (player.get('radio') && player.queue.tracks.length < 3 && !lazyOf(player).length) void radioFill(player);
+    });
   });
   manager.on('queueEnd', (player: Player) => {
+    // Сначала дозагружаем отложенные треки (плейлисты Spotify), потом радио
+    if (lazyOf(player).length) {
+      void topUp(player).then((n) => {
+        if (!n) void showPanel(client, player, false);
+      });
+      return;
+    }
     if (player.get('radio')) {
-      // Радио включено — подбираем ещё, а не показываем «очередь закончилась»
       void radioFill(player).then((n) => {
         if (!n) void showPanel(client, player, false);
       });
@@ -141,6 +148,11 @@ export function setup(client: Client) {
   manager.on('trackError', (player: Player, track: any, payload: any) => {
     console.warn('[music] Ошибка трека:', track?.info?.title, payload?.exception?.message);
     void notify(client, player, `⚠️ Не получилось воспроизвести **${track?.info?.title ?? 'трек'}** — пропускаю.`);
+    setTimeout(() => void keepGoing(player), 1500);
+  });
+  manager.on('trackStuck', (player: Player, track: any) => {
+    console.warn('[music] Трек завис:', track?.info?.title);
+    setTimeout(() => void keepGoing(player), 1500);
   });
   manager.on('playerDestroy', (player: Player) => void closePanel(player.guildId));
 
@@ -428,6 +440,91 @@ export async function onAutocomplete(i: AutocompleteInteraction) {
   return i.respond(choices).catch(() => {});
 }
 
+// ───────────────────────── поиск на SoundCloud и отложенная очередь ─────────────────────────
+//
+// Треки Spotify (ссылки, плейлисты, радио) не играем «как есть»: бот сам находит каждый на SoundCloud.
+// Плейлисты кладутся в отложенную очередь и находятся по ходу, по несколько треков вперёд.
+
+interface LazyItem {
+  artist: string;
+  title: string;
+  durationMs?: number;
+  requester: unknown;
+}
+
+const lazyBusy = new Set<string>();
+const lazyOf = (player: Player): LazyItem[] => player.get('lazy') ?? [];
+const isSpotifyTrack = (t: Track) => (t.info as any)?.sourceName === 'spotify';
+const toLazy = (t: Track, requester: unknown): LazyItem => ({
+  artist: t.info.author ?? '',
+  title: t.info.title ?? '',
+  durationMs: t.info.duration ?? undefined,
+  requester,
+});
+
+/** Ищет трек на SoundCloud; при нескольких вариантах берёт ближайший по длительности. */
+async function findOnSoundCloud(artist: string, title: string, requester: unknown, durationMs?: number) {
+  const q = `${artist} ${title}`.trim();
+  if (!q) return undefined;
+  const res = await loadTracks(`scsearch:${q}`, requester);
+  const ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS);
+  if (!ok.length) return undefined;
+  if (durationMs) {
+    const close = ok
+      .slice(0, 6)
+      .map((t) => ({ t, diff: Math.abs((t.info.duration ?? 0) - durationMs) }))
+      .sort((x, y) => x.diff - y.diff)[0];
+    if (close && close.diff < 25_000) return close.t;
+  }
+  return ok[0];
+}
+
+/** Переносит треки из отложенной очереди в настоящую, пока впереди не будет min треков. */
+async function topUp(player: Player, min = 3): Promise<number> {
+  const gid = player.guildId;
+  if (lazyBusy.has(gid)) return 0;
+  lazyBusy.add(gid);
+  let added = 0;
+  try {
+    const lazy = lazyOf(player);
+    let misses = 0;
+    while (lazy.length && player.queue.tracks.length < min && manager.getPlayer(gid) && misses < 10) {
+      const item = lazy.shift()!;
+      player.set('lazy', lazy);
+      const tr = await findOnSoundCloud(item.artist, item.title, item.requester, item.durationMs).catch(() => undefined);
+      if (!tr) {
+        misses++;
+        console.warn(`[music] Не нашёл на SoundCloud: ${item.artist} — ${item.title}`);
+        continue;
+      }
+      await player.queue.add(tr);
+      added++;
+      if (!player.playing && !player.paused) await player.play().catch(() => {});
+    }
+    player.set('lazy', lazy);
+    if (added) await refreshPanel(player);
+  } finally {
+    lazyBusy.delete(gid);
+  }
+  return added;
+}
+
+/** После ошибки трека: если плеер встал — продолжаем со следующего. */
+async function keepGoing(player: Player) {
+  if (!manager.getPlayer(player.guildId) || player.paused) return;
+  if (player.playing && player.queue.current) return;
+  try {
+    if (player.queue.tracks.length) {
+      await player.skip(0, false);
+      return;
+    }
+    if (lazyOf(player).length && (await topUp(player))) return;
+    if (player.get('radio') && (await radioFill(player))) return;
+  } catch (e) {
+    console.warn('[music] Не удалось продолжить очередь:', (e as Error).message);
+  }
+}
+
 /** Общая часть /play и /play_file: проверка голосового, плеер, очередь. */
 async function enqueue(
   i: ChatInputCommandInteraction<'cached'>,
@@ -455,9 +552,23 @@ async function enqueue(
     return i.editReply('🔍 Ничего не нашёл. Попробуй по-другому: «исполнитель — название» или ссылку.');
   }
 
+  // Ссылки Spotify: сам Spotify не играем — находим треки на SoundCloud
+  const spotify = res.tracks.length > 0 && res.tracks.every(isSpotifyTrack);
+  let lazyItems: LazyItem[] = [];
+
   let added: Track[];
   let label: string;
-  if (res.kind === 'playlist') {
+  if (spotify && res.kind === 'playlist') {
+    lazyItems = res.tracks.map((t) => toLazy(t, i.user));
+    added = [];
+    label = `📃 Плейлист Spotify **${truncate(res.playlistName ?? 'плейлист', 80)}** — ${lazyItems.length} треков. Ищу их на SoundCloud по ходу воспроизведения.`;
+  } else if (spotify) {
+    const sp = res.tracks[0];
+    const found = await findOnSoundCloud(sp.info.author ?? '', sp.info.title ?? '', i.user, sp.info.duration ?? undefined);
+    if (!found) return i.editReply(`🔍 Трек **${truncate(`${sp.info.author} — ${sp.info.title}`, 90)}** есть в Spotify, но на SoundCloud его не нашлось.`);
+    added = [found];
+    label = `➕ В очереди: **${truncate(found.info.title, 80)}** (${formatDuration(found.info.duration)}) — найдено по ссылке Spotify`;
+  } else if (res.kind === 'playlist') {
     added = res.tracks;
     label = `📃 Добавлен плейлист **${truncate(res.playlistName ?? 'плейлист', 80)}** — ${added.length} треков`;
   } else {
@@ -483,9 +594,14 @@ async function enqueue(
   }
   if (!player.connected) await player.connect();
 
-  await player.queue.add(added);
+  if (added.length) await player.queue.add(added);
+  if (lazyItems.length) {
+    if (player.get('shuffle')) lazyItems.sort(() => Math.random() - 0.5);
+    player.set('lazy', [...lazyOf(player), ...lazyItems]);
+  }
   if (player.get('shuffle')) await player.queue.shuffle();
-  if (!player.playing && !player.paused) await player.play();
+  if (lazyItems.length) await topUp(player);
+  if (!player.playing && !player.paused && player.queue.tracks.length) await player.play();
   else await refreshPanel(player);
 
   return i.editReply(label);
@@ -759,10 +875,10 @@ async function spotifyMix(seed: Track): Promise<Track[]> {
   return res.tracks;
 }
 
-type RadioItem = { track?: Track; artist: string; title: string };
+type RadioItem = { track?: Track; artist: string; title: string; durationMs?: number };
 
 /** Добавляет в очередь до count похожих треков. Возвращает, сколько добавлено. */
-async function radioFill(player: Player, deezerCount = 8): Promise<number> {
+async function radioFill(player: Player, deezerCount = 10): Promise<number> {
   const gid = player.guildId;
   if (radioBusy.has(gid)) return 0;
   radioBusy.add(gid);
@@ -790,7 +906,7 @@ async function radioFill(player: Player, deezerCount = 8): Promise<number> {
       } catch (e) {
         console.warn('[music] Spotify Mix:', (e as Error).message);
       }
-      const fromSpotify = fresh(mix.map((t) => ({ track: t, artist: t.info.author ?? '', title: t.info.title ?? '' })));
+      const fromSpotify = fresh(mix.map((t) => ({ artist: t.info.author ?? '', title: t.info.title ?? '', durationMs: t.info.duration ?? undefined })));
       if (fromSpotify.length) {
         pending = [...pending, ...fromSpotify];
         source = 'Spotify';
@@ -805,8 +921,8 @@ async function radioFill(player: Player, deezerCount = 8): Promise<number> {
     }
 
     let added = 0;
-    // Spotify-микс добавляем целиком (треки уже готовы), Deezer — порциями: каждый надо искать на SoundCloud
-    const limit = source === 'Spotify' ? 100 : deezerCount;
+    // Каждый трек ищем на SoundCloud — поэтому порциями; остальные ждут в запасе и добавятся по ходу
+    const limit = deezerCount;
     while (pending.length && added < limit && player.get('radio') && manager.getPlayer(gid)) {
       const c = pending.shift()!;
       const key = trackKey(c.artist, c.title);
@@ -814,15 +930,14 @@ async function radioFill(player: Player, deezerCount = 8): Promise<number> {
       seen.add(key);
       let tr = c.track;
       if (!tr) {
-        // Трек из Deezer — ищем его на SoundCloud
-        const res = await loadTracks(`scsearch:${c.artist} ${c.title}`, RADIO_REQUESTER);
-        tr = res.tracks.find((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS);
-        await sleep(250);
+        // Ищем трек из подборки на SoundCloud
+        tr = await findOnSoundCloud(c.artist, c.title, RADIO_REQUESTER, c.durationMs).catch(() => undefined);
+        await sleep(200);
       }
       if (!tr) continue;
       await player.queue.add(tr);
       added++;
-      if (!player.playing && !player.paused && !player.queue.current) await player.play();
+      if (!player.playing && !player.paused) await player.play().catch(() => {});
     }
 
     player.set('radioPending', pending.slice(0, 100));
@@ -925,10 +1040,16 @@ function queueEmbed(player: Player | undefined) {
     .slice(0, 15)
     .map((t: any, idx: number) => `\`${idx + 1}.\` ${truncate(t.info.title, 60)} — ${t.info.isStream ? 'эфир' : formatDuration(t.info.duration)}`);
   const more = player.queue.tracks.length > 15 ? `\n…и ещё ${player.queue.tracks.length - 15}` : '';
+  const lazy = lazyOf(player);
+  const pending: RadioItem[] = player.get('radio') ? player.get('radioPending') ?? [] : [];
+  const extra = [
+    lazy.length ? `⏳ Из плейлиста Spotify ждут поиска на SoundCloud: **${lazy.length}** (следующий: ${truncate(`${lazy[0].artist} — ${lazy[0].title}`, 60)})` : '',
+    pending.length ? `📻 В запасе у радио: **${pending.length}** — добавятся по ходу` : '',
+  ].filter(Boolean).join('\n');
   return baseEmbed()
     .setTitle('📜 Очередь')
     .setDescription(
-      `**Сейчас:** ${truncate(player.queue.current.info.title, 80)}\n\n${lines.join('\n') || 'Дальше пусто.'}${more}`,
+      `**Сейчас:** ${truncate(player.queue.current.info.title, 80)}\n\n${lines.join('\n') || 'Дальше пусто.'}${more}${extra ? `\n\n${extra}` : ''}`,
     );
 }
 
