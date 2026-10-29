@@ -6,7 +6,7 @@ lavalink:
   plugins:
     # LavaSrc — понимает ссылки Spotify и ищет эти треки на SoundCloud.
     # Свежую версию смотри тут: https://github.com/topi314/LavaSrc/releases
-    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.7.3"
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
       repository: "https://maven.lavalink.dev/releases"
   server:
     # Пароль берётся из .env (LAVALINK_PASSWORD), эта строка — запасной вариант
@@ -51,6 +51,11 @@ plugins:
       clientId: ""
       clientSecret: ""
       preferAnonymousToken: true
+      # Анонимные токены выдаёт сервис spotify-tokener (см. docker-compose.yml).
+      # С версии LavaSrc 4.7.3 без этого адреса запросы к Spotify не работают.
+      customTokenEndpoint: "http://spotify-tokener:8080/api/token"
+      # Меньше запросов к Spotify при поиске (рекомендация автора LavaSrc)
+      resolveArtistsInSearch: false
       countryCode: "US"
       playlistLoadLimit: 6   # страниц по 100 треков
       albumLoadLimit: 6

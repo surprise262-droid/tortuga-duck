@@ -11,6 +11,19 @@ services:
       - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
     expose:
       - "2333"
+    depends_on:
+      - spotify-tokener
+
+  # Выдаёт анонимные токены Spotify для LavaSrc (ссылки Spotify и радио).
+  # Без него LavaSrc не может обращаться к Spotify. Сделан автором LavaSrc, внутри — headless Chrome.
+  spotify-tokener:
+    image: ghcr.io/topi314/spotify-tokener:master
+    restart: unless-stopped
+    environment:
+      - SPOTIFY_TOKENER_ADDR=0.0.0.0:8080
+      - SPOTIFY_TOKENER_LOG_LEVEL=INFO
+    expose:
+      - "8080"
 
   # Сам бот
   bot:
@@ -29,7 +42,7 @@ services:
       - ./assets:/app/assets   # картинки уток и фон приветствия
 
   # RSSHub превращает Telegram-каналы (и сайты без RSS) в RSS-ленты.
-  # Нужен для аниме-новостей из @animolll. Доступен только боту, наружу не открыт.
+  # Нужен для новостей из Telegram (аниме, кино). Доступен только боту, наружу не открыт.
   rsshub:
     image: diygod/rsshub:latest
     restart: unless-stopped
