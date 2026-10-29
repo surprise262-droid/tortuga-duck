@@ -6,6 +6,8 @@ import {
   GuildMember,
   MessageFlags,
   SlashCommandBuilder,
+  StringSelectMenuOptionBuilder,
+  StringSelectMenuBuilder,
   type AutocompleteInteraction,
   type ChatInputCommandInteraction,
   type Client,
@@ -523,12 +525,103 @@ function repeatLabel(mode: string) {
   return mode === 'track' ? 'трек' : mode === 'queue' ? 'очередь' : 'выкл';
 }
 
+// ───────────────────────── эффекты звука ─────────────────────────
+
+/** Пресеты эффектов: ключ → [подпись, эмодзи, описание] */
+const FX: Record<string, [string, string, string]> = {
+  off: ['Без эффектов', '🎵', 'Обычный звук'],
+  bass: ['Bass Boost', '🔊', 'Усиленные басы'],
+  '8d': ['8D', '🎧', 'Звук кружит вокруг головы — слушать в наушниках'],
+  nightcore: ['Nightcore', '⚡', 'Быстрее и выше'],
+  slowed: ['Slowed', '🌙', 'Медленнее и ниже (slowed)'],
+  karaoke: ['Караоке', '🎤', 'Приглушает голос'],
+  lofi: ['Lo-Fi', '📻', 'Мягкий приглушённый звук'],
+  soft: ['Мягкий', '☁️', 'Тише верхи, без резкости'],
+};
+
+const BASS_BOOST = [
+  { band: 0, gain: 0.3 },
+  { band: 1, gain: 0.25 },
+  { band: 2, gain: 0.2 },
+  { band: 3, gain: 0.1 },
+  { band: 4, gain: 0.05 },
+];
+const SOFT_EQ = [
+  { band: 10, gain: -0.15 },
+  { band: 11, gain: -0.2 },
+  { band: 12, gain: -0.25 },
+  { band: 13, gain: -0.25 },
+  { band: 14, gain: -0.25 },
+];
+
+async function applyFx(player: Player, key: string) {
+  const fm: any = (player as any).filterManager;
+  if (!fm) throw new Error('эффекты недоступны в этой версии плеера');
+  await fm.resetFilters();
+  switch (key) {
+    case 'bass':
+      await fm.setEQ(BASS_BOOST);
+      break;
+    case '8d':
+      await fm.toggleRotation(0.2);
+      break;
+    case 'nightcore':
+      await fm.toggleNightcore();
+      break;
+    case 'slowed':
+      await fm.toggleVaporwave();
+      break;
+    case 'karaoke':
+      await fm.toggleKaraoke();
+      break;
+    case 'lofi':
+      await fm.toggleLowPass(20);
+      break;
+    case 'soft':
+      await fm.setEQ(SOFT_EQ);
+      break;
+  }
+  player.set('fx', key);
+}
+
+function fxMenu(player: Player) {
+  const current = player.get('fx') ?? 'off';
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('music:fx')
+    .setPlaceholder(`🎛 Эффект: ${FX[current]?.[0] ?? 'Без эффектов'}`)
+    .addOptions(
+      Object.entries(FX).map(([key, [label, emoji, desc]]) =>
+        new StringSelectMenuOptionBuilder().setValue(key).setLabel(label).setEmoji(emoji).setDescription(desc).setDefault(key === current),
+      ),
+    );
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+}
+
 // ───────────────────────── кнопки плеера ─────────────────────────
 
 export async function onComponent(i: ComponentInteraction) {
-  if (!i.isButton() || !i.inCachedGuild()) return;
+  if (!i.inCachedGuild()) return;
   const action = i.customId.split(':')[1];
   const player = manager.getPlayer(i.guildId);
+
+  // Выпадающее меню эффектов
+  if (i.isStringSelectMenu() && action === 'fx') {
+    const err = checkControl(i.member, player, 'fx');
+    if (err) return respond(i, err);
+    const key = i.values[0] ?? 'off';
+    try {
+      await applyFx(player!, key);
+    } catch (e) {
+      console.warn('[music] Эффект:', (e as Error).message);
+      return respond(i, `⚠️ Не получилось включить эффект: ${(e as Error).message}`);
+    }
+    await i.update(panelPayload(player!));
+    return i.followUp({
+      content: key === 'off' ? '🎵 Эффекты выключены.' : `${FX[key][1]} Эффект **${FX[key][0]}** включён.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+  if (!i.isButton()) return;
 
   if (action === 'queue') return respond(i, { embeds: [queueEmbed(player)] });
 
@@ -627,20 +720,39 @@ async function similarTracks(seed: Track): Promise<{ artist: string; title: stri
  * Работает через плагин LavaSrc (sprec:mix:…), треки из микса LavaSrc сам находит и играет через SoundCloud.
  * Чтобы найти трек в Spotify без API-ключей, берём его ISRC (код записи) из Deezer.
  */
-async function spotifyMix(seed: Track): Promise<Track[]> {
+/** Находит текущий трек в Spotify и возвращает запрос микса для LavaSrc. */
+async function spotifySeedQuery(seed: Track): Promise<string | undefined> {
   const info: any = seed.info;
-  let query: string | undefined;
-  if (info.sourceName === 'spotify' && info.identifier) query = `sprec:mix:track:${info.identifier}`;
-  else if (info.isrc) query = `sprec:mix:isrc:${info.isrc}`;
-  else {
-    const { artist, title } = splitArtistTitle(info);
-    const found = await deezer(`/search?q=${encodeURIComponent(`${artist} ${title}`.trim())}&limit=1`);
-    const id = found?.data?.[0]?.id;
-    if (id) {
-      const t = await deezer(`/track/${id}`);
-      if (t?.isrc) query = `sprec:mix:isrc:${t.isrc}`;
-    }
+  // Трек и так из Spotify
+  if (info.sourceName === 'spotify' && info.identifier) return `sprec:mix:track:${info.identifier}`;
+  if (info.isrc) return `sprec:mix:isrc:${info.isrc}`;
+
+  const { artist, title } = splitArtistTitle(info);
+  const q = `${artist} ${title}`.trim();
+  if (!q) return undefined;
+
+  // 1) Поиск прямо в Spotify (через LavaSrc)
+  const sp = await loadTracks(`spsearch:${q}`, RADIO_REQUESTER);
+  const hit = sp.tracks[0] as any;
+  if (hit?.info?.identifier && hit.info.sourceName === 'spotify') return `sprec:mix:track:${hit.info.identifier}`;
+  if (sp.kind === 'error') console.warn(`[music] Spotify-поиск «${q}»: ${sp.error}`);
+
+  // 2) Запасной путь: код записи (ISRC) из Deezer — по нему Spotify находит тот же трек
+  const found = await deezer(`/search?q=${encodeURIComponent(q)}&limit=1`);
+  const id = found?.data?.[0]?.id;
+  if (id) {
+    const t = await deezer(`/track/${id}`);
+    if (t?.isrc) return `sprec:mix:isrc:${t.isrc}`;
   }
+  return undefined;
+}
+
+/**
+ * Spotify Mix по треку — тот же подбор, что у «радио» в приложении Spotify (через LavaSrc).
+ * Сами треки играются не из Spotify: при запуске LavaSrc находит каждый на SoundCloud (см. providers).
+ */
+async function spotifyMix(seed: Track): Promise<Track[]> {
+  const query = await spotifySeedQuery(seed);
   if (!query) return [];
   const res = await loadTracks(query, RADIO_REQUESTER);
   if (res.kind === 'error') console.warn(`[music] Spotify Mix (${query}): ${res.error}`);
@@ -650,7 +762,7 @@ async function spotifyMix(seed: Track): Promise<Track[]> {
 type RadioItem = { track?: Track; artist: string; title: string };
 
 /** Добавляет в очередь до count похожих треков. Возвращает, сколько добавлено. */
-async function radioFill(player: Player, count = 8): Promise<number> {
+async function radioFill(player: Player, deezerCount = 8): Promise<number> {
   const gid = player.guildId;
   if (radioBusy.has(gid)) return 0;
   radioBusy.add(gid);
@@ -670,7 +782,7 @@ async function radioFill(player: Player, count = 8): Promise<number> {
     let pending: RadioItem[] = fresh(player.get('radioPending') ?? []);
     let source: string = player.get('radioSource') ?? '';
 
-    if (pending.length < count) {
+    if (pending.length < deezerCount) {
       // 1) Spotify Mix
       let mix: Track[] = [];
       try {
@@ -693,7 +805,9 @@ async function radioFill(player: Player, count = 8): Promise<number> {
     }
 
     let added = 0;
-    while (pending.length && added < count && player.get('radio') && manager.getPlayer(gid)) {
+    // Spotify-микс добавляем целиком (треки уже готовы), Deezer — порциями: каждый надо искать на SoundCloud
+    const limit = source === 'Spotify' ? 100 : deezerCount;
+    while (pending.length && added < limit && player.get('radio') && manager.getPlayer(gid)) {
       const c = pending.shift()!;
       const key = trackKey(c.artist, c.title);
       if (seen.has(key)) continue;
@@ -777,6 +891,8 @@ function panelPayload(player: Player) {
   if (requester) {
     embed.addFields({ name: 'Заказал', value: requester === RADIO_REQUESTER.id ? '📻 Радио' : `<@${requester}>`, inline: true });
   }
+  const fx = player.get('fx');
+  if (fx && fx !== 'off' && FX[fx]) embed.addFields({ name: 'Эффект', value: `${FX[fx][1]} ${FX[fx][0]}`, inline: true });
   if (player.get('radio')) {
     const src = player.get('radioSource');
     embed.addFields({ name: 'Радио', value: `📻 вкл${src ? ` · подбор ${src}` : ''}`, inline: true });
@@ -796,7 +912,7 @@ function panelPayload(player: Player) {
     btn('queue', '📜'),
     btn('radio', '📻', player.get('radio') ? ButtonStyle.Success : ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: [row1, row2] };
+  return { embeds: [embed], components: [row1, row2, fxMenu(player)] };
 }
 
 function btn(action: string, emoji: string, style = ButtonStyle.Secondary) {
