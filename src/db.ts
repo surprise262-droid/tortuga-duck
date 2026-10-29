@@ -27,6 +27,10 @@ db.exec(`
     count     INTEGER NOT NULL DEFAULT 0,
     last_at   INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS sc_bad (
+    uri TEXT PRIMARY KEY,
+    ts  INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS news_seen (
     feed TEXT NOT NULL,
     guid TEXT NOT NULL,

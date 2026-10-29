@@ -147,8 +147,9 @@ export function setup(client: Client) {
   });
   manager.on('trackError', (player: Player, track: any, payload: any) => {
     console.warn('[music] Ошибка трека:', track?.info?.title, payload?.exception?.message);
-    void notify(client, player, `⚠️ Не получилось воспроизвести **${track?.info?.title ?? 'трек'}** — пропускаю.`);
-    setTimeout(() => void keepGoing(player), 1500);
+    void onTrackFailed(client, player, track)
+      .catch((e) => console.warn('[music] Замена трека:', (e as Error).message))
+      .finally(() => setTimeout(() => void keepGoing(player), 500));
   });
   manager.on('trackStuck', (player: Player, track: any) => {
     console.warn('[music] Трек завис:', track?.info?.title);
@@ -463,20 +464,67 @@ const toLazy = (t: Track, requester: unknown): LazyItem => ({
 });
 
 /** Ищет трек на SoundCloud; при нескольких вариантах берёт ближайший по длительности. */
+// Загрузки SoundCloud, которые не воспроизводятся (обычно официальные треки лейблов только для Go+).
+// Запоминаем на 30 дней и больше не выбираем.
+const BAD_TTL_MS = 30 * 24 * 60 * 60_000;
+function isBad(uri?: string | null) {
+  if (!uri) return false;
+  const row = db.prepare('SELECT ts FROM sc_bad WHERE uri = ?').get(uri) as { ts: number } | undefined;
+  return !!row && Date.now() - row.ts < BAD_TTL_MS;
+}
+function markBad(uri?: string | null) {
+  if (!uri) return;
+  db.prepare('INSERT INTO sc_bad (uri, ts) VALUES (?, ?) ON CONFLICT(uri) DO UPDATE SET ts = excluded.ts').run(uri, Date.now());
+}
+
+/** Прикрепляет к треку запасные варианты — если он не заиграет, бот попробует следующий */
+function withAlternatives(main: Track, others: Track[]): Track {
+  const alts = others.map((t) => t.info.uri).filter((u): u is string => !!u && u !== main.info.uri && !isBad(u)).slice(0, 4);
+  (main as any).userData = { ...((main as any).userData ?? {}), alts };
+  return main;
+}
+
+/** Ищет трек на SoundCloud; ранжирует варианты по длительности, неиграбельные пропускает. */
 async function findOnSoundCloud(artist: string, title: string, requester: unknown, durationMs?: number) {
   const q = `${artist} ${title}`.trim();
   if (!q) return undefined;
   const res = await loadTracks(`scsearch:${q}`, requester);
-  const ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS);
+  let ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri));
   if (!ok.length) return undefined;
   if (durationMs) {
-    const close = ok
-      .slice(0, 6)
-      .map((t) => ({ t, diff: Math.abs((t.info.duration ?? 0) - durationMs) }))
-      .sort((x, y) => x.diff - y.diff)[0];
-    if (close && close.diff < 25_000) return close.t;
+    // Сначала варианты, близкие по длительности к оригиналу, потом остальные
+    const near = ok.filter((t) => Math.abs((t.info.duration ?? 0) - durationMs) < 25_000);
+    const far = ok.filter((t) => !near.includes(t));
+    near.sort((x, y) => Math.abs((x.info.duration ?? 0) - durationMs) - Math.abs((y.info.duration ?? 0) - durationMs));
+    ok = [...near, ...far];
   }
-  return ok[0];
+  return withAlternatives(ok[0], ok.slice(1));
+}
+
+/**
+ * Трек не заиграл: запоминаем загрузку как неиграбельную и сразу ставим следующим запасной вариант.
+ * Предупреждение в канал — только если трек заказывал человек и замены не нашлось.
+ */
+async function onTrackFailed(client: Client, player: Player, track: any) {
+  markBad(track?.info?.uri);
+  const alts: string[] = (track?.userData?.alts ?? []).filter((u: string) => !isBad(u));
+  for (let k = 0; k < alts.length; k++) {
+    const res = await loadTracks(alts[k], track.requester).catch(() => null);
+    const alt = res?.tracks[0];
+    if (!alt) {
+      markBad(alts[k]);
+      continue;
+    }
+    (alt as any).userData = { ...((alt as any).userData ?? {}), alts: alts.slice(k + 1) };
+    await player.queue.add(alt, 0);
+    console.log(`[music] «${track?.info?.title}» не играет — пробую другую загрузку: ${alt.info.title}`);
+    await refreshPanel(player);
+    return;
+  }
+  const requester = track?.requester?.id;
+  if (requester && requester !== RADIO_REQUESTER.id) {
+    void notify(client, player, `⚠️ **${truncate(track?.info?.title ?? 'Трек', 80)}** не воспроизводится на SoundCloud — пропускаю.`);
+  }
 }
 
 /** Переносит треки из отложенной очереди в настоящую, пока впереди не будет min треков. */
@@ -575,8 +623,11 @@ async function enqueue(
     // В поиске пропускаем 30-секундные превью, если есть полноценная версия
     const full =
       res.kind === 'search'
-        ? res.tracks.find((t) => t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS) ?? res.tracks[0]
+        ? res.tracks.find((t) => (t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS) && !isBad(t.info.uri)) ?? res.tracks[0]
         : res.tracks[0];
+    if (res.kind === 'search') {
+      withAlternatives(full, res.tracks.filter((t) => t !== full && !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS));
+    }
     if (fileName) (full.info as any).title = fileName;
     added = [full];
     label = `➕ В очереди: **${truncate(full.info.title, 80)}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
