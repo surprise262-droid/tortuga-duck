@@ -24,6 +24,7 @@ import { baseEmbed, formatDuration, isManager, respond, truncate } from '../util
 export const componentPrefix = 'music';
 
 let manager: LavalinkManager;
+let botClient: Client | null = null;
 /** guildId → сообщение-плеер */
 const panels = new Map<string, Message>();
 /** guildId → таймер обновления прогресс-бара */
@@ -84,6 +85,7 @@ export const commands = [
 // ───────────────────────── инициализация ─────────────────────────
 
 export function setup(client: Client) {
+  botClient = client;
   manager = new LavalinkManager({
     nodes: [
       {
@@ -113,7 +115,15 @@ export function setup(client: Client) {
     await manager.init({ id: c.user.id, username: c.user.username });
   });
 
-  manager.nodeManager.on('connect', (node: any) => console.log(`[music] Lavalink подключён (${node.id})`));
+  manager.nodeManager.on('connect', (node: any) => {
+    console.log(`[music] Lavalink подключён (${node.id})`);
+    // Прогрев: первый запрос к Spotify получает токен (это медленно) — делаем его заранее, а не на радио
+    setTimeout(() => {
+      void loadTracks('spsearch:imagine dragons believer', null).then((r) =>
+        console.log(`[music] Spotify прогрет: ${r.tracks.length ? 'ок' : r.kind === 'error' ? `ошибка — ${r.error}` : 'пусто'}`),
+      );
+    }, 5000);
+  });
   manager.nodeManager.on('error', (node: any, err: any) => console.error(`[music] Ошибка Lavalink (${node.id}):`, err?.message ?? err));
   manager.nodeManager.on('disconnect', (node: any) => console.warn(`[music] Lavalink отключился (${node.id})`));
 
@@ -821,6 +831,13 @@ export async function onComponent(i: ComponentInteraction) {
     case 'volup':
       await p.setVolume(Math.min(150, p.volume + 10));
       break;
+    case 'radio_deezer': {
+      p.set('radioDeezerOnce', true);
+      if (!p.get('radio')) p.set('radio', true);
+      await i.update({ content: '📻 Подбираю похожие через Deezer…', components: [] });
+      const n = await radioFill(p);
+      return i.editReply({ content: n ? `📻 Deezer подобрал и добавил ${n} треков.` : '📻 Deezer тоже ничего не нашёл.' }).catch(() => {});
+    }
     case 'radio': {
       const on = await toggleRadio(p);
       await i.update(panelPayload(p));
@@ -887,43 +904,78 @@ async function similarTracks(seed: Track): Promise<{ artist: string; title: stri
  * Работает через плагин LavaSrc (sprec:mix:…), треки из микса LavaSrc сам находит и играет через SoundCloud.
  * Чтобы найти трек в Spotify без API-ключей, берём его ISRC (код записи) из Deezer.
  */
-/** Находит текущий трек в Spotify и возвращает запрос микса для LavaSrc. */
-async function spotifySeedQuery(seed: Track): Promise<string | undefined> {
-  const info: any = seed.info;
-  // Трек и так из Spotify
-  if (info.sourceName === 'spotify' && info.identifier) return `sprec:mix:track:${info.identifier}`;
-  if (info.isrc) return `sprec:mix:isrc:${info.isrc}`;
-
-  const { artist, title } = splitArtistTitle(info);
-  const q = `${artist} ${title}`.trim();
-  if (!q) return undefined;
-
-  // 1) Поиск прямо в Spotify (через LavaSrc)
-  const sp = await loadTracks(`spsearch:${q}`, RADIO_REQUESTER);
-  const hit = sp.tracks[0] as any;
-  if (hit?.info?.identifier && hit.info.sourceName === 'spotify') return `sprec:mix:track:${hit.info.identifier}`;
-  if (sp.kind === 'error') console.warn(`[music] Spotify-поиск «${q}»: ${sp.error}`);
-
-  // 2) Запасной путь: код записи (ISRC) из Deezer — по нему Spotify находит тот же трек
-  const found = await deezer(`/search?q=${encodeURIComponent(q)}&limit=1`);
-  const id = found?.data?.[0]?.id;
-  if (id) {
-    const t = await deezer(`/track/${id}`);
-    if (t?.isrc) return `sprec:mix:isrc:${t.isrc}`;
-  }
-  return undefined;
-}
-
 /**
- * Spotify Mix по треку — тот же подбор, что у «радио» в приложении Spotify (через LavaSrc).
- * Сами треки играются не из Spotify: при запуске LavaSrc находит каждый на SoundCloud (см. providers).
+ * Spotify-подборка для трека. Пробует по очереди:
+ *  1) микс по треку (трек ищем в самом Spotify: по ссылке, по ISRC, поиском по названию);
+ *  2) микс по исполнителю этого трека;
+ *  3) микс по ISRC из Deezer (Deezer тут только «справочник» кода записи, подбор всё равно от Spotify).
+ * Каждый шаг пишет в лог, почему не получилось.
  */
 async function spotifyMix(seed: Track): Promise<Track[]> {
-  const query = await spotifySeedQuery(seed);
-  if (!query) return [];
-  const res = await loadTracks(query, RADIO_REQUESTER);
-  if (res.kind === 'error') console.warn(`[music] Spotify Mix (${query}): ${res.error}`);
-  return res.tracks;
+  const first = await spotifyMixOnce(seed);
+  if (first.length) return first;
+  // Частая временная ошибка: токен Spotify ещё не готов (первый запрос после запуска/простоя). Повторяем.
+  await sleep(3000);
+  console.log('[music] Spotify-подборка: повторная попытка');
+  return spotifyMixOnce(seed);
+}
+
+async function spotifyMixOnce(seed: Track): Promise<Track[]> {
+  const info: any = seed.info;
+  const { artist, title } = splitArtistTitle(info);
+  const label = `${artist} — ${title}`;
+  const tried: string[] = [];
+
+  const tryMix = async (query: string, why: string) => {
+    const res = await loadTracks(query, RADIO_REQUESTER);
+    if (res.tracks.length) {
+      console.log(`[music] Spotify-подборка «${label}»: ${why} → ${res.tracks.length} треков`);
+      return res.tracks;
+    }
+    tried.push(`${why}: ${res.kind === 'error' ? res.error : 'пусто'}`);
+    return [];
+  };
+
+  let tracks: Track[] = [];
+  // Трек и так из Spotify / есть код записи
+  if (info.sourceName === 'spotify' && info.identifier) tracks = await tryMix(`sprec:mix:track:${info.identifier}`, 'по треку (ссылка)');
+  if (!tracks.length && info.isrc) tracks = await tryMix(`sprec:mix:isrc:${info.isrc}`, 'по ISRC трека');
+
+  // Поиск в Spotify: «исполнитель название», потом только название
+  let artistUrl: string | undefined;
+  if (!tracks.length) {
+    for (const q of [`${artist} ${title}`.trim(), title].filter((x, k, arr) => x && arr.indexOf(x) === k)) {
+      const sp = await loadTracks(`spsearch:${q}`, RADIO_REQUESTER);
+      const hit = sp.tracks.find((t: any) => t.info?.sourceName === 'spotify') as any;
+      if (!hit) {
+        tried.push(`поиск «${q}»: ${sp.kind === 'error' ? sp.error : 'не найдено'}`);
+        continue;
+      }
+      artistUrl = hit.pluginInfo?.artistUrl;
+      tracks = await tryMix(`sprec:mix:track:${hit.info.identifier}`, `по треку «${hit.info.author} — ${hit.info.title}»`);
+      break;
+    }
+  }
+
+  // Микс по исполнителю
+  const artistId = artistUrl?.match(/artist\/([A-Za-z0-9]+)/)?.[1];
+  if (!tracks.length && artistId) tracks = await tryMix(`sprec:mix:artist:${artistId}`, 'по исполнителю');
+
+  // ISRC из Deezer → микс Spotify
+  if (!tracks.length) {
+    try {
+      const found = await deezer(`/search?q=${encodeURIComponent(`${artist} ${title}`.trim())}&limit=1`);
+      const id = found?.data?.[0]?.id;
+      const t = id ? await deezer(`/track/${id}`) : null;
+      if (t?.isrc) tracks = await tryMix(`sprec:mix:isrc:${t.isrc}`, `по ISRC ${t.isrc}`);
+      else tried.push('ISRC: трека нет в Deezer');
+    } catch (e) {
+      tried.push(`ISRC: ${(e as Error).message}`);
+    }
+  }
+
+  if (!tracks.length) console.warn(`[music] Spotify-подборка «${label}» не получилась:\n  - ${tried.join('\n  - ')}`);
+  return tracks;
 }
 
 type RadioItem = { track?: Track; artist: string; title: string; durationMs?: number };
@@ -961,12 +1013,21 @@ async function radioFill(player: Player, deezerCount = 10): Promise<number> {
       if (fromSpotify.length) {
         pending = [...pending, ...fromSpotify];
         source = 'Spotify';
-      } else {
-        // 2) Запасной вариант — радио исполнителя на Deezer
+        player.set('radioSpotifyFailed', false);
+      } else if (getSetting('radio_deezer') === '1' || player.get('radioDeezerOnce')) {
+        // Запасной подбор через Deezer — только если включён в /setup или нажали кнопку
+        player.set('radioDeezerOnce', false);
         const fromDeezer = fresh((await similarTracks(seed).catch(() => [])).sort(() => Math.random() - 0.5));
         if (fromDeezer.length) {
           pending = [...pending, ...fromDeezer];
           source = 'Deezer';
+        }
+      } else if (!pending.length) {
+        // Spotify не смог — не подменяем молча. Предлагаем Deezer кнопкой, а на следующем треке снова пробуем Spotify
+        source = 'Spotify ✗';
+        if (player.get('radioOfferedFor') !== seed.info.uri) {
+          player.set('radioOfferedFor', seed.info.uri);
+          void offerDeezer(player, `${seed.info.author ?? ''} — ${seed.info.title}`);
         }
       }
     }
@@ -1061,7 +1122,8 @@ function panelPayload(player: Player) {
   if (fx && fx !== 'off' && FX[fx]) embed.addFields({ name: 'Эффект', value: `${FX[fx][1]} ${FX[fx][0]}`, inline: true });
   if (player.get('radio')) {
     const src = player.get('radioSource');
-    embed.addFields({ name: 'Радио', value: `📻 вкл${src ? ` · подбор ${src}` : ''}`, inline: true });
+    const srcText = src === 'Spotify ✗' ? ' · Spotify не нашёл, жду следующий трек' : src ? ` · подбор ${src}` : '';
+    embed.addFields({ name: 'Радио', value: `📻 вкл${srcText}`, inline: true });
   }
   if (next) embed.addFields({ name: 'Дальше', value: next });
 
@@ -1200,6 +1262,23 @@ function closePanel(guildId: string) {
       .edit({ embeds: [baseEmbed().setTitle('🦆 Музыка остановлена').setDescription('Бар закрыт до следующего `/play`.')], components: [] })
       .catch(() => {});
   });
+}
+
+/** Spotify не подобрал — предлагаем Deezer кнопкой (сообщение само исчезнет через минуту) */
+async function offerDeezer(player: Player, label: string) {
+  if (!botClient) return;
+  const channel = await getTextChannel(botClient, player);
+  if (!channel || !('send' in channel)) return;
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('music:radio_deezer').setLabel('Подобрать через Deezer').setEmoji('📻').setStyle(ButtonStyle.Secondary),
+  );
+  const m = await channel
+    .send({
+      content: `📻 Spotify не смог подобрать похожие для **${truncate(label, 80)}**. Радио попробует снова на следующем треке.`,
+      components: [row],
+    })
+    .catch(() => null);
+  if (m) setTimeout(() => m.delete().catch(() => {}), 60_000);
 }
 
 async function notify(client: Client, player: Player, text: string) {

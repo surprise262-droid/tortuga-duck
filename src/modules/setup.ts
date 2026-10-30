@@ -73,6 +73,12 @@ export const commands = [
         .setDescription('Включить или выключить DJ-режим')
         .addBooleanOption((o) => o.setName('enabled').setDescription('Включён?').setRequired(true)),
     )
+    .addSubcommand((s) =>
+      s
+        .setName('radio_deezer')
+        .setDescription('Радио: подбирать через Deezer автоматически, если Spotify не смог')
+        .addBooleanOption((o) => o.setName('enabled').setDescription('Включено? (по умолчанию — нет, только кнопкой)').setRequired(true)),
+    )
     .addSubcommand((s) => s.setName('show').setDescription('Показать текущие настройки')),
 ];
 
@@ -130,12 +136,24 @@ export async function onCommand(i: ChatInputCommandInteraction) {
     );
   }
 
+  if (sub === 'radio_deezer') {
+    const enabled = i.options.getBoolean('enabled', true);
+    setSetting('radio_deezer', enabled ? '1' : '0');
+    return respond(
+      i,
+      enabled
+        ? '📻 Если Spotify не подберёт похожие, радио **само** возьмёт подборку Deezer.'
+        : '📻 Радио подбирает **только через Spotify**. Если он не справится, бот предложит Deezer кнопкой.',
+    );
+  }
+
   // show
   const s = allSettings();
   const lines = [
     ...CHANNEL_PURPOSES.map(([k, label]) => `${label}: ${s[`channel.${k}`] ? `<#${s[`channel.${k}`]}>` : '—'}`),
     ...ROLE_PURPOSES.map(([k, label]) => `${label}: ${s[`role.${k}`] ? `<@&${s[`role.${k}`]}>` : '—'}`),
     `DJ-режим: ${s['dj_mode'] === '1' ? 'включён' : 'выключен'}`,
+    `Радио, запасной Deezer: ${s['radio_deezer'] === '1' ? 'автоматически' : 'только кнопкой'}`,
   ];
   return respond(i, { embeds: [baseEmbed().setTitle('⚙️ Настройки Tortuga Duck').setDescription(lines.join('\n'))] });
 }
