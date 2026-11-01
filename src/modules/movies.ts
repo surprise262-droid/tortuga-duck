@@ -9,6 +9,7 @@ import {
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
 import { trailerButtonRow, trailerMenus } from '../trailerUi';
+import { upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -356,12 +357,36 @@ async function run(client: Client): Promise<string> {
       notable.forEach((x) => seen.add(x.key));
     }
 
-    await updateCalendar(channel, movies, series, cfg);
+    await migrateOldCards(channel).catch((e) => console.warn('[movies] Перестройка старых карточек:', (e as Error).message));
+    const calStatus = await updateCalendar(channel, movies, series, cfg);
     if (posted) console.log(`[movies] Новых премьер: ${posted}`);
-    return `✅ TMDB: фильмов ${movies.length}, сериалов ${series.length}. Новых карточек: ${posted}. Календарь обновлён.`;
+    return `✅ TMDB: фильмов ${movies.length}, сериалов ${series.length}. Новых карточек: ${posted}. ${calStatus}`;
   } finally {
     running = false;
   }
+}
+
+/**
+ * Разово: старые карточки (до кнопок) были со ссылкой «▶️ Трейлер: …» над карточкой.
+ * Убираем ссылку и ставим кнопку «Трейлер». Бот правит только свои сообщения.
+ */
+async function migrateOldCards(channel: any) {
+  if (getSetting('movies.cards_migrated') === '1') return;
+  const me = channel.client?.user?.id;
+  const messages = await channel.messages.fetch({ limit: 100 });
+  let fixed = 0;
+  for (const m of messages.values()) {
+    if (m.author?.id !== me || !m.content?.startsWith('▶️ Трейлер:') || !m.embeds?.length) continue;
+    const url = m.embeds[0]?.url ?? '';
+    const found = url.match(/themoviedb\.org\/(movie|tv)\/(\d+)/);
+    if (!found) continue;
+    await m
+      .edit({ content: '', components: [trailerButtonRow(found[1] === 'movie' ? 'tmdbm' : 'tmdbt', Number(found[2]))] })
+      .then(() => fixed++)
+      .catch((e: Error) => console.warn('[movies] Не перестроилась карточка:', e.message));
+  }
+  setSetting('movies.cards_migrated', '1');
+  if (fixed) console.log(`[movies] Старых карточек перестроено: ${fixed}`);
 }
 
 // ───────────────────────── оформление ─────────────────────────
@@ -432,22 +457,8 @@ function calendarComponents(movies: Entry[], series: Entry[]) {
   ];
 }
 
-async function updateCalendar(channel: any, movies: Entry[], series: Entry[], cfg: MoviesConfig) {
+async function updateCalendar(channel: any, movies: Entry[], series: Entry[], cfg: MoviesConfig): Promise<string> {
   const embeds = calendarEmbeds(movies, series, cfg);
   const components = calendarComponents(movies, series);
-  const msgId = getSetting('movies.calendar_msg');
-  if (msgId) {
-    const msg = await channel.messages.fetch(msgId).catch(() => null);
-    if (msg) {
-      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[movies] Не обновился календарь:', e.message));
-      return;
-    }
-  }
-  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
-    console.warn('[movies] Не отправился календарь:', e.message);
-    return null;
-  });
-  if (!msg) return;
-  setSetting('movies.calendar_msg', msg.id);
-  await msg.pin().catch(() => console.warn('[movies] Не удалось закрепить календарь (нужно право «Управлять сообщениями»)'));
+  return upsertPinned(channel, 'movies.calendar_msg', { embeds, components }, 'movies');
 }

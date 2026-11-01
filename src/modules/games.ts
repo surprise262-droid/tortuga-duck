@@ -9,6 +9,7 @@ import {
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
 import { trailerButtonRow, trailerMenus } from '../trailerUi';
+import { upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -253,9 +254,9 @@ async function run(client: Client): Promise<string> {
       notable.forEach((g) => seen.add(g.id));
     }
 
-    await updateCalendar(channel, list, cfg);
+    const calStatus = await updateCalendar(channel, list, cfg);
     if (posted) console.log(`[games] Новых релизов в календаре: ${posted}`);
-    return `✅ IGDB: ${list.length} релизов на ${cfg.calendarDays} дней. Новых карточек: ${posted}. Календарь обновлён.`;
+    return `✅ IGDB: ${list.length} релизов на ${cfg.calendarDays} дней. Новых карточек: ${posted}. ${calStatus}`;
   } finally {
     running = false;
   }
@@ -383,22 +384,8 @@ function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
   return embeds;
 }
 
-async function updateCalendar(channel: any, list: IgdbGame[], cfg: GamesConfig) {
+async function updateCalendar(channel: any, list: IgdbGame[], cfg: GamesConfig): Promise<string> {
   const embeds = calendarEmbeds(list, cfg);
   const components = calendarComponents(list, cfg);
-  const msgId = getSetting('games.calendar_msg');
-  if (msgId) {
-    const msg = await channel.messages.fetch(msgId).catch(() => null);
-    if (msg) {
-      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[games] Не обновился календарь:', e.message));
-      return;
-    }
-  }
-  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
-    console.warn('[games] Не отправился календарь:', e.message);
-    return null;
-  });
-  if (!msg) return;
-  setSetting('games.calendar_msg', msg.id);
-  await msg.pin().catch(() => console.warn('[games] Не удалось закрепить календарь (нужно право «Управлять сообщениями»)'));
+  return upsertPinned(channel, 'games.calendar_msg', { embeds, components }, 'games');
 }

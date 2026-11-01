@@ -9,6 +9,7 @@ import {
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
 import { trailerButtonRow, trailerMenus } from '../trailerUi';
+import { upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -190,9 +191,9 @@ async function run(client: Client): Promise<string> {
       list.filter((a) => !seen.has(a.id)).forEach((a) => seen.add(a.id));
     }
 
-    await updateCalendar(channel as any, list, cfg);
+    const calStatus = await updateCalendar(channel as any, list, cfg);
     if (posted) console.log(`[anime] Новых анонсов: ${posted}`);
-    return `✅ Shikimori: ${list.length} анонсов. Новых опубликовано: ${posted}. Календарь обновлён.`;
+    return `✅ Shikimori: ${list.length} анонсов. Новых опубликовано: ${posted}. ${calStatus}`;
   } finally {
     running = false;
   }
@@ -201,6 +202,12 @@ async function run(client: Client): Promise<string> {
 // ───────────────────────── оформление ─────────────────────────
 
 const titleOf = (a: ShikiAnime) => a.russian?.trim() || a.name;
+const MONTHS_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+/** «05.11», а если стоит 1-е число (Shikimori так помечает «известен только месяц») — «~ноя» */
+const shortDate = (d: Date) =>
+  d.getUTCDate() === 1
+    ? `~${MONTHS_SHORT[d.getUTCMonth()]}`
+    : `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 const linkOf = (a: ShikiAnime & { base: string }) => `${a.base}${a.url}`;
 const imageOf = (a: ShikiAnime & { base: string }) => {
   const p = a.image?.original ?? a.image?.preview;
@@ -253,7 +260,7 @@ function calendarComponents(list: (ShikiAnime & { base: string })[], cfg: AnimeC
     source: 'shiki' as const,
     id: a.id,
     title: titleOf(a),
-    hint: `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')} · ${KIND_RU[a.kind ?? ''] ?? a.kind ?? ''}`,
+    hint: `${shortDate(d)} · ${KIND_RU[a.kind ?? ''] ?? a.kind ?? ''}`,
   }));
   return trailerMenus(items, '▶️ Трейлер к аниме…', 'anime', 2);
 }
@@ -304,7 +311,7 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
   let total = 0;
   for (const { a, d } of upcoming) {
     const m = `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
-    const dd = `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const dd = shortDate(d);
     const line = `\`${dd}\` [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind}\n`;
     // Discord: до 10 embed'ов и ~6000 символов на сообщение, описание до 4096
     if (total + line.length > 5200) break;
@@ -324,24 +331,10 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
 }
 
 /** Редактирует закреплённый календарь в канале (или создаёт и закрепляет новый). */
-async function updateCalendar(channel: any, list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
+async function updateCalendar(channel: any, list: (ShikiAnime & { base: string })[], cfg: AnimeConfig): Promise<string> {
   const embeds = calendarEmbeds(list, cfg);
   const components = calendarComponents(list, cfg);
-  const msgId = getSetting('anime.calendar_msg');
-  if (msgId) {
-    const msg = await channel.messages.fetch(msgId).catch(() => null);
-    if (msg) {
-      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[anime] Не обновился календарь:', e.message));
-      return;
-    }
-  }
-  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
-    console.warn('[anime] Не отправился календарь:', e.message);
-    return null;
-  });
-  if (!msg) return;
-  setSetting('anime.calendar_msg', msg.id);
-  await msg.pin().catch(() => console.warn('[anime] Не удалось закрепить календарь (нужно право «Управлять сообщениями»)'));
+  return upsertPinned(channel, 'anime.calendar_msg', { embeds, components }, 'anime');
 }
 
 /** Для /setup: сразу запустить проверку после назначения канала. */
