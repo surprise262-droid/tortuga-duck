@@ -13,8 +13,9 @@ import * as news from './modules/news';
 import * as anime from './modules/anime';
 import * as games from './modules/games';
 import * as movies from './modules/movies';
+import * as trailers from './modules/trailers';
 
-const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games, movies];
+const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games, movies, trailers];
 
 const client = new Client({
   intents: [

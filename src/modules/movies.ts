@@ -8,6 +8,7 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
+import { trailerButtonRow, trailerMenus } from '../trailerUi';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -92,7 +93,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
     const cfg = loadCfg();
     try {
       const { movies, series } = await fetchAll(cfg);
-      return i.editReply({ embeds: calendarEmbeds(movies, series, cfg) });
+      return i.editReply({ embeds: calendarEmbeds(movies, series, cfg), components: calendarComponents(movies, series) });
     } catch (e) {
       return i.editReply(`⚠️ TMDB: ${truncate((e as Error).message, 200)}`);
     }
@@ -267,10 +268,10 @@ async function fetchAll(cfg: MoviesConfig) {
 }
 
 /** Трейлер на YouTube: сначала на русском, потом любой */
-async function trailerUrl(e: Entry): Promise<string | undefined> {
+async function trailerFor(kind: 'movie' | 'tv', id: number): Promise<string | undefined> {
   for (const language of ['ru-RU', 'en-US']) {
     try {
-      const j = await tmdb(`/${e.kind}/${e.id}/videos`, { language });
+      const j = await tmdb(`/${kind}/${id}/videos`, { language });
       const v = (j?.results ?? [])
         .filter((x: any) => x.site === 'YouTube' && ['Trailer', 'Teaser'].includes(x.type))
         .sort((a: any, b: any) => Number(b.type === 'Trailer') - Number(a.type === 'Trailer') || Number(b.official) - Number(a.official))[0];
@@ -280,6 +281,18 @@ async function trailerUrl(e: Entry): Promise<string | undefined> {
     }
   }
   return undefined;
+}
+
+/** Для кнопки/меню «Трейлер»: название и ссылка на трейлер */
+export async function tmdbTrailer(kind: 'movie' | 'tv', id: number): Promise<{ title: string; url?: string }> {
+  if (keyMissing()) return { title: '' };
+  const d = await tmdb(`/${kind}/${id}`, { language: loadCfg().language }).catch(() => null);
+  let title: string = (kind === 'movie' ? d?.title || d?.original_title : d?.name || d?.original_name) ?? '';
+  if (title && !readable(title)) {
+    const en = await tmdb(`/${kind}/${id}`, { language: 'en-US' }).catch(() => null);
+    title = (kind === 'movie' ? en?.title : en?.name) || title;
+  }
+  return { title, url: await trailerFor(kind, id) };
 }
 
 // ───────────────────────── основной цикл ─────────────────────────
@@ -328,9 +341,12 @@ async function run(client: Client): Promise<string> {
     } else {
       for (const x of notable.filter((n) => !seen.has(n.key)).slice(0, 4)) {
         try {
-          const trailer = await trailerUrl(x);
-          // Ссылку на трейлер отправляем текстом — Discord покажет под ней плеер
-          await channel.send({ content: trailer ? `▶️ Трейлер: ${trailer}` : undefined, embeds: [announceEmbed(x)] });
+          // Кнопка «Трейлер» — только если трейлер есть; сам трейлер придёт лично нажавшему
+          const trailer = await trailerFor(x.kind, x.id);
+          await channel.send({
+            embeds: [announceEmbed(x)],
+            components: trailer ? [trailerButtonRow(x.kind === 'movie' ? 'tmdbm' : 'tmdbt', x.id)] : [],
+          });
           posted++;
         } catch (e) {
           console.warn('[movies] Не отправилась карточка:', (e as Error).message);
@@ -397,17 +413,37 @@ function calendarEmbeds(movies: Entry[], series: Entry[], cfg: MoviesConfig) {
   ];
 }
 
+/** Меню «▶️ Трейлер к фильму / сериалу…» под календарём */
+function calendarComponents(movies: Entry[], series: Entry[]) {
+  const byDate = (arr: Entry[]) => [...arr].sort((a, b) => a.date.getTime() - b.date.getTime());
+  return [
+    ...trailerMenus(
+      byDate(movies).map((x) => ({ source: 'tmdbm' as const, id: x.id, title: x.title, hint: `🎬 ${dd(x.date)}` })),
+      '▶️ Трейлер к фильму…',
+      'mov',
+      1,
+    ),
+    ...trailerMenus(
+      byDate(series).map((x) => ({ source: 'tmdbt' as const, id: x.id, title: x.title, hint: `📺 ${dd(x.date)} · ${x.note ?? ''}` })),
+      '▶️ Трейлер к сериалу…',
+      'tv',
+      1,
+    ),
+  ];
+}
+
 async function updateCalendar(channel: any, movies: Entry[], series: Entry[], cfg: MoviesConfig) {
   const embeds = calendarEmbeds(movies, series, cfg);
+  const components = calendarComponents(movies, series);
   const msgId = getSetting('movies.calendar_msg');
   if (msgId) {
     const msg = await channel.messages.fetch(msgId).catch(() => null);
     if (msg) {
-      await msg.edit({ embeds }).catch((e: Error) => console.warn('[movies] Не обновился календарь:', e.message));
+      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[movies] Не обновился календарь:', e.message));
       return;
     }
   }
-  const msg = await channel.send({ embeds }).catch((e: Error) => {
+  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
     console.warn('[movies] Не отправился календарь:', e.message);
     return null;
   });

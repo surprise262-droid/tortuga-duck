@@ -8,6 +8,7 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
+import { trailerButtonRow, trailerMenus } from '../trailerUi';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -90,7 +91,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       return null;
     });
     if (!list) return i.editReply('⚠️ Shikimori сейчас недоступен, попробуй позже.');
-    return i.editReply({ embeds: calendarEmbeds(list, loadCfg()) });
+    return i.editReply({ embeds: calendarEmbeds(list, loadCfg()), components: calendarComponents(list, loadCfg()) });
   }
   const res = await run(i.client);
   return i.editReply(res);
@@ -178,7 +179,8 @@ async function run(client: Client): Promise<string> {
       const fresh = list.filter((a) => !seen.has(a.id)).sort((a, b) => a.id - b.id).slice(0, 5);
       for (const a of fresh) {
         try {
-          await channel.send({ embeds: [announceEmbed(a)] });
+          const video = await animeVideo(a.id).catch(() => undefined);
+          await channel.send({ embeds: [announceEmbed(a)], components: video ? [trailerButtonRow('shiki', a.id)] : [] });
           posted++;
         } catch (e) {
           console.warn('[anime] Не отправился анонс:', (e as Error).message);
@@ -234,14 +236,52 @@ function announceEmbed(a: ShikiAnime & { base: string }) {
 }
 
 /** Ближайшие премьеры по месяцам, названия — ссылки. Режем на несколько embed'ов (лимиты Discord). */
-function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
+/** Ближайшие премьеры с известной датой — для календаря и меню трейлеров */
+function upcomingOf(list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
   const now = Date.now();
   const until = now + cfg.calendarDays * 24 * 60 * 60_000;
-  const upcoming = list
+  return list
     .map((a) => ({ a, d: dateRu(a.aired_on) }))
     .filter((x): x is { a: ShikiAnime & { base: string }; d: Date } => !!x.d && x.d.getTime() >= now - 24 * 60 * 60_000 && x.d.getTime() <= until)
     .sort((x, y) => x.d.getTime() - y.d.getTime())
     .slice(0, cfg.calendarMax);
+}
+
+/** Меню «▶️ Трейлер к аниме…» под календарём (наличие трейлера проверяется при выборе) */
+function calendarComponents(list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
+  const items = upcomingOf(list, cfg).map(({ a, d }) => ({
+    source: 'shiki' as const,
+    id: a.id,
+    title: titleOf(a),
+    hint: `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')} · ${KIND_RU[a.kind ?? ''] ?? a.kind ?? ''}`,
+  }));
+  return trailerMenus(items, '▶️ Трейлер к аниме…', 'anime', 2);
+}
+
+/** Видео тайтла на Shikimori: PV/трейлер с YouTube */
+async function animeVideo(id: number): Promise<string | undefined> {
+  const { data } = await shikiGet(loadCfg(), `/api/animes/${Math.floor(id)}/videos`);
+  const list = (Array.isArray(data) ? data : []).filter((v: any) => /youtu/i.test(String(v.url ?? v.player_url ?? '')));
+  const pick =
+    list.find((v: any) => v.kind === 'pv' || /trailer|трейлер|pv|тизер|teaser/i.test(v.name ?? '')) ??
+    list.find((v: any) => v.kind === 'cm') ??
+    list[0];
+  if (!pick) return undefined;
+  const raw = String(pick.url ?? pick.player_url);
+  const vid = raw.match(/(?:v=|youtu\.be\/|embed\/)([\w-]{11})/)?.[1];
+  return vid ? `https://www.youtube.com/watch?v=${vid}` : raw.replace(/^http:/, 'https:');
+}
+
+/** Для кнопки/меню «Трейлер» */
+export async function animeTrailer(id: number): Promise<{ title: string; url?: string }> {
+  const { data } = await shikiGet(loadCfg(), `/api/animes/${Math.floor(id)}`).catch(() => ({ data: null as any }));
+  const title = data ? titleOf(data) : '';
+  const url = await animeVideo(id).catch(() => undefined);
+  return { title, url };
+}
+
+function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
+  const upcoming = upcomingOf(list, cfg);
 
   const header = new EmbedBuilder()
     .setColor(0xeb459e)
@@ -286,15 +326,16 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
 /** Редактирует закреплённый календарь в канале (или создаёт и закрепляет новый). */
 async function updateCalendar(channel: any, list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
   const embeds = calendarEmbeds(list, cfg);
+  const components = calendarComponents(list, cfg);
   const msgId = getSetting('anime.calendar_msg');
   if (msgId) {
     const msg = await channel.messages.fetch(msgId).catch(() => null);
     if (msg) {
-      await msg.edit({ embeds }).catch((e: Error) => console.warn('[anime] Не обновился календарь:', e.message));
+      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[anime] Не обновился календарь:', e.message));
       return;
     }
   }
-  const msg = await channel.send({ embeds }).catch((e: Error) => {
+  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
     console.warn('[anime] Не отправился календарь:', e.message);
     return null;
   });

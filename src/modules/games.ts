@@ -8,6 +8,7 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
+import { trailerButtonRow, trailerMenus } from '../trailerUi';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -41,6 +42,7 @@ interface IgdbGame {
   genres?: { name: string }[];
   platforms?: { abbreviation?: string; name?: string }[];
   external_games?: { url?: string }[];
+  videos?: { video_id?: string; name?: string }[];
   summary?: string;
 }
 
@@ -84,7 +86,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       return null;
     });
     if (!list) return i.editReply(credentialsMissing() ?? '⚠️ IGDB сейчас недоступен, попробуй позже.');
-    return i.editReply({ embeds: calendarEmbeds(list, cfg) });
+    return i.editReply({ embeds: calendarEmbeds(list, cfg), components: calendarComponents(list, cfg) });
   }
   return i.editReply(await run(i.client));
 }
@@ -146,6 +148,23 @@ async function igdb(endpoint: string, body: string): Promise<any[]> {
   return (await res.json()) as any[];
 }
 
+/** Лучшее видео игры: трейлер, если есть, иначе первое */
+function bestVideo(videos?: { video_id?: string; name?: string }[]): string | undefined {
+  const list = (videos ?? []).filter((v) => v.video_id);
+  const pick =
+    list.find((v) => /launch|release|official trailer/i.test(v.name ?? '')) ??
+    list.find((v) => /trailer|трейлер/i.test(v.name ?? '')) ??
+    list[0];
+  return pick?.video_id ? `https://www.youtube.com/watch?v=${pick.video_id}` : undefined;
+}
+
+/** Для кнопки/меню «Трейлер» */
+export async function gameTrailer(id: number): Promise<{ title: string; url?: string }> {
+  if (credentialsMissing()) return { title: '' };
+  const [g] = await igdb('games', `fields name,videos.video_id,videos.name; where id = ${Math.floor(id)};`);
+  return { title: g?.name ?? '', url: bestVideo(g?.videos) };
+}
+
 /** Ближайшие релизы: только основные игры (без DLC и переизданий), с минимальной «ожидаемостью» */
 async function fetchUpcoming(cfg: GamesConfig): Promise<IgdbGame[]> {
   if (credentialsMissing()) throw new Error('нет ключей Twitch');
@@ -162,6 +181,8 @@ async function fetchUpcoming(cfg: GamesConfig): Promise<IgdbGame[]> {
     'platforms.abbreviation',
     'platforms.name',
     'external_games.url',
+    'videos.video_id',
+    'videos.name',
   ].join(',');
   return igdb(
     'games',
@@ -219,7 +240,10 @@ async function run(client: Client): Promise<string> {
     } else {
       for (const g of notable.filter((x) => !seen.has(x.id)).slice(0, 5)) {
         try {
-          await channel.send({ embeds: [announceEmbed(g)] });
+          await channel.send({
+            embeds: [announceEmbed(g)],
+            components: bestVideo(g.videos) ? [trailerButtonRow('igdb', g.id)] : [],
+          });
           posted++;
         } catch (e) {
           console.warn('[games] Не отправилась карточка:', (e as Error).message);
@@ -294,11 +318,27 @@ function announceEmbed(g: IgdbGame) {
 }
 
 /** Календарь по дням: самые ожидаемые, отсортированные по дате. Режем на несколько embed'ов под лимиты Discord. */
-function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
-  const picked = [...list]
+/** Что попадает в календарь: самые ожидаемые, по дате */
+function pickGames(list: IgdbGame[], cfg: GamesConfig) {
+  return [...list]
     .sort((a, b) => (b.hypes ?? 0) - (a.hypes ?? 0))
     .slice(0, cfg.calendarMax)
     .sort((a, b) => (a.first_release_date ?? 0) - (b.first_release_date ?? 0));
+}
+
+/** Меню «▶️ Трейлер к игре…» — только для игр, у которых есть видео */
+function calendarComponents(list: IgdbGame[], cfg: GamesConfig) {
+  const items = pickGames(list, cfg)
+    .filter((g) => bestVideo(g.videos))
+    .map((g) => {
+      const d = dateOf(g);
+      return { source: 'igdb' as const, id: g.id, title: g.name, hint: `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}${platformsOf(g) ? ` · ${platformsOf(g)}` : ''}` };
+    });
+  return trailerMenus(items, '▶️ Трейлер к игре…', 'games', 2);
+}
+
+function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
+  const picked = pickGames(list, cfg);
 
   const header = new EmbedBuilder()
     .setColor(COLOR)
@@ -345,15 +385,16 @@ function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
 
 async function updateCalendar(channel: any, list: IgdbGame[], cfg: GamesConfig) {
   const embeds = calendarEmbeds(list, cfg);
+  const components = calendarComponents(list, cfg);
   const msgId = getSetting('games.calendar_msg');
   if (msgId) {
     const msg = await channel.messages.fetch(msgId).catch(() => null);
     if (msg) {
-      await msg.edit({ embeds }).catch((e: Error) => console.warn('[games] Не обновился календарь:', e.message));
+      await msg.edit({ embeds, components }).catch((e: Error) => console.warn('[games] Не обновился календарь:', e.message));
       return;
     }
   }
-  const msg = await channel.send({ embeds }).catch((e: Error) => {
+  const msg = await channel.send({ embeds, components }).catch((e: Error) => {
     console.warn('[games] Не отправился календарь:', e.message);
     return null;
   });
