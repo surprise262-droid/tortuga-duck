@@ -1,0 +1,7 @@
+{
+  "minHype": 10,
+  "announceMinHype": 25,
+  "calendarDays": 60,
+  "calendarMax": 50,
+  "intervalMinutes": 120
+}

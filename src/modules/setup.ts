@@ -7,6 +7,7 @@ import {
 import { allSettings, getSetting, setSetting } from '../db';
 import { baseEmbed, respond } from '../util';
 import { resetAnimeAnnounce, runAnimeNow } from './anime';
+import { resetGamesAnnounce, runGamesNow } from './games';
 import { resetCategory, runNewsNow } from './news';
 import { postControlPanel } from './privateVoice';
 import { postRolesPanel } from './roles';
@@ -23,6 +24,7 @@ export const CHANNEL_PURPOSES: [string, string, boolean][] = [
   ['news_anime', 'Новости: аниме', false],
   ['news_free', 'Новости: халява', false],
   ['anime_announce', 'Аниме: анонсы и календарь', false],
+  ['games_announce', 'Игры: релизы и календарь', false],
 ];
 
 const ROLE_PURPOSES: [string, string][] = [
@@ -101,6 +103,13 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       resetCategory(purpose.slice('news_'.length));
       void runNewsNow(i.client);
       extra = '\nСейчас опубликую в него по одной свежей новости от каждого источника.';
+    }
+    if (purpose === 'games_announce' && previous !== channel.id) {
+      resetGamesAnnounce();
+      void runGamesNow(i.client);
+      extra = process.env.TWITCH_CLIENT_ID
+        ? '\nСейчас создам и закреплю в нём календарь релизов. Новые заметные игры будут приходить сюда же.'
+        : '\n⚠️ Чтобы календарь заработал, добавь TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET в .env на сервере.';
     }
     if (purpose === 'anime_announce' && previous !== channel.id) {
       resetAnimeAnnounce();
