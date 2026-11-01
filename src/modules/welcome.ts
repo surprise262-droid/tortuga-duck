@@ -43,14 +43,19 @@ export const commands = [
   new SlashCommandBuilder()
     .setName('welcome-test')
     .setDescription('Показать, как выглядит приветствие (для админов)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addBooleanOption((o) =>
+      o.setName('send').setDescription('Отправить по-настоящему в канал приветствий (проверка всего пути)'),
+    ),
 ];
 
 export function setup(client: Client) {
   client.on(Events.GuildMemberAdd, async (member) => {
     if (member.user.bot) return;
+    console.log(`[welcome] Новый участник: ${member.user.tag}`);
     await giveBaseRole(member);
-    await sendWelcome(member).catch((e) => console.error('[welcome] Ошибка:', e));
+    const result = await sendWelcome(member).catch((e) => `ошибка: ${e?.message ?? e}`);
+    console.log(`[welcome] Приветствие для ${member.user.tag}: ${result}`);
   });
 }
 
@@ -63,16 +68,32 @@ async function giveBaseRole(member: GuildMember) {
 export async function onCommand(i: ChatInputCommandInteraction) {
   if (!i.inCachedGuild()) return;
   await i.deferReply({ flags: MessageFlags.Ephemeral });
-  const payload = await buildWelcome(i.member);
-  return i.editReply(payload);
+  // send:true — пройти весь путь как при настоящем входе: отправить в канал приветствий
+  if (i.options.getBoolean('send')) {
+    const result = await sendWelcome(i.member).catch((e) => `ошибка: ${e?.message ?? e}`);
+    return i.editReply(result === 'отправлено' ? '✅ Приветствие отправлено в канал приветствий.' : `❌ Не отправилось: ${result}`);
+  }
+  return i.editReply(await buildWelcome(i.member));
 }
 
-async function sendWelcome(member: GuildMember) {
+/** Отправляет приветствие в канал. Возвращает «отправлено» или причину, почему нет. */
+async function sendWelcome(member: GuildMember): Promise<string> {
   const channelId = getSetting('channel.welcome');
-  if (!channelId) return;
-  const channel = await member.guild.channels.fetch(channelId).catch(() => null);
-  if (!channel?.isTextBased() || !('send' in channel)) return;
+  if (!channelId) return 'канал приветствий не назначен (/setup channel → Приветствия новичков)';
+  const channel = await member.guild.channels.fetch(channelId).catch((e) => {
+    console.warn('[welcome] Не открыть канал:', e?.message);
+    return null;
+  });
+  if (!channel) return `бот не видит канал ${channelId} — нет доступа или канал удалён`;
+  if (!channel.isTextBased() || !('send' in channel)) return 'это не текстовый канал';
+
+  const me = member.guild.members.me;
+  const perms = me ? channel.permissionsFor(me) : null;
+  const missing = (['ViewChannel', 'SendMessages', 'EmbedLinks', 'AttachFiles'] as const).filter((p) => !perms?.has(p));
+  if (missing.length) return `в канале не хватает прав у бота: ${missing.join(', ')}`;
+
   await channel.send(await buildWelcome(member));
+  return 'отправлено';
 }
 
 async function buildWelcome(member: GuildMember) {
@@ -81,15 +102,22 @@ async function buildWelcome(member: GuildMember) {
     phrases: ['{user} заходит в бар. Утка за стойкой уже наливает 🍺'],
   });
   const phrase = (pickRandom(cfg.phrases) ?? '').replaceAll('{user}', `<@${member.id}>`).replaceAll('{name}', member.displayName);
-  const card = await renderCard(member, cfg.title);
-  const file = new AttachmentBuilder(card, { name: 'welcome.png' });
   const accent = (await member.user.fetch(true).catch(() => member.user)).accentColor;
   const embed = baseEmbed()
     .setDescription(phrase)
-    .setImage('attachment://welcome.png')
     .setFooter({ text: `Посетитель №${member.guild.memberCount}` });
   if (accent) embed.setColor(accent);
-  return { content: `<@${member.id}>`, embeds: [embed], files: [file] };
+
+  // Если карточка не нарисовалась — всё равно приветствуем, просто без картинки
+  try {
+    const card = await renderCard(member, cfg.title);
+    embed.setImage('attachment://welcome.png');
+    return { content: `<@${member.id}>`, embeds: [embed], files: [new AttachmentBuilder(card, { name: 'welcome.png' })] };
+  } catch (e) {
+    console.warn('[welcome] Карточка не нарисовалась, отправляю без неё:', (e as Error).message);
+    embed.setThumbnail(member.displayAvatarURL({ size: 256 }));
+    return { content: `<@${member.id}>`, embeds: [embed], files: [] };
+  }
 }
 
 function listImages(dir: string): string[] {
