@@ -91,8 +91,12 @@ export async function onCommand(i: ChatInputCommandInteraction) {
 
 // ───────────────────────── IGDB ─────────────────────────
 
+/** Ключи из .env без случайных пробелов и кавычек */
+const twitchId = () => (process.env.TWITCH_CLIENT_ID ?? '').trim().replace(/^["']|["']$/g, '');
+const twitchSecret = () => (process.env.TWITCH_CLIENT_SECRET ?? '').trim().replace(/^["']|["']$/g, '');
+
 function credentialsMissing(): string | null {
-  if (process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET) return null;
+  if (twitchId() && twitchSecret()) return null;
   return '⚪ Не заданы TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET в .env — календарь игр выключен.';
 }
 
@@ -101,12 +105,21 @@ let token: { value: string; expiresAt: number } | null = null;
 async function getToken(): Promise<string> {
   if (token && Date.now() < token.expiresAt - 60_000) return token.value;
   const q = new URLSearchParams({
-    client_id: process.env.TWITCH_CLIENT_ID ?? '',
-    client_secret: process.env.TWITCH_CLIENT_SECRET ?? '',
+    client_id: twitchId(),
+    client_secret: twitchSecret(),
     grant_type: 'client_credentials',
   });
   const res = await fetch(`https://id.twitch.tv/oauth2/token?${q}`, { method: 'POST', signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`Twitch авторизация: HTTP ${res.status} — проверь TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET`);
+  if (!res.ok) {
+    const body: any = await res.json().catch(() => ({}));
+    const msg = String(body?.message ?? '');
+    const hint = /secret/i.test(msg)
+      ? 'неверный TWITCH_CLIENT_SECRET (рабочий только последний созданный)'
+      : /client/i.test(msg)
+        ? 'неверный TWITCH_CLIENT_ID или приложение типа Public — нужно Confidential'
+        : 'проверь TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET';
+    throw new Error(`Twitch авторизация: HTTP ${res.status} «${msg || 'без текста'}» — ${hint}`);
+  }
   const json: any = await res.json();
   token = { value: json.access_token, expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000 };
   return token.value;
@@ -117,7 +130,7 @@ async function igdb(endpoint: string, body: string): Promise<any[]> {
     fetch(`https://api.igdb.com/v4/${endpoint}`, {
       method: 'POST',
       headers: {
-        'Client-ID': process.env.TWITCH_CLIENT_ID ?? '',
+        'Client-ID': twitchId(),
         Authorization: `Bearer ${await getToken()}`,
         Accept: 'application/json',
       },

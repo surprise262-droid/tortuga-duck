@@ -8,6 +8,7 @@ import { allSettings, getSetting, setSetting } from '../db';
 import { baseEmbed, respond } from '../util';
 import { resetAnimeAnnounce, runAnimeNow } from './anime';
 import { resetGamesAnnounce, runGamesNow } from './games';
+import { resetMoviesAnnounce, runMoviesNow } from './movies';
 import { resetCategory, runNewsNow } from './news';
 import { postControlPanel } from './privateVoice';
 import { postRolesPanel } from './roles';
@@ -25,6 +26,7 @@ export const CHANNEL_PURPOSES: [string, string, boolean][] = [
   ['news_free', 'Новости: халява', false],
   ['anime_announce', 'Аниме: анонсы и календарь', false],
   ['games_announce', 'Игры: релизы и календарь', false],
+  ['movies_announce', 'Кино и сериалы: премьеры и календарь', false],
 ];
 
 const ROLE_PURPOSES: [string, string][] = [
@@ -103,6 +105,13 @@ export async function onCommand(i: ChatInputCommandInteraction) {
       resetCategory(purpose.slice('news_'.length));
       void runNewsNow(i.client);
       extra = '\nСейчас опубликую в него по одной свежей новости от каждого источника.';
+    }
+    if (purpose === 'movies_announce' && previous !== channel.id) {
+      resetMoviesAnnounce();
+      void runMoviesNow(i.client);
+      extra = process.env.TMDB_API_KEY
+        ? '\nСейчас создам и закреплю календарь премьер. Новые громкие фильмы и сезоны будут приходить сюда же с трейлерами.'
+        : '\n⚠️ Чтобы календарь заработал, добавь TMDB_API_KEY в .env на сервере.';
     }
     if (purpose === 'games_announce' && previous !== channel.id) {
       resetGamesAnnounce();

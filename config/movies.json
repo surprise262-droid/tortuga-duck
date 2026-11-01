@@ -1,0 +1,10 @@
+{
+  "language": "ru-RU",
+  "days": 60,
+  "moviesMax": 20,
+  "seriesMax": 20,
+  "movieMinPopularity": 15,
+  "seriesMinPopularity": 20,
+  "announceMinPopularity": 60,
+  "intervalMinutes": 180
+}

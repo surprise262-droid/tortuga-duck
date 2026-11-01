@@ -12,8 +12,9 @@ import * as roles from './modules/roles';
 import * as news from './modules/news';
 import * as anime from './modules/anime';
 import * as games from './modules/games';
+import * as movies from './modules/movies';
 
-const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games];
+const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games, movies];
 
 const client = new Client({
   intents: [
