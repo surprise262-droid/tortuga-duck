@@ -431,8 +431,23 @@ export async function onAutocomplete(i: AutocompleteInteraction) {
   const cached = suggestCache.get(key);
   if (cached && Date.now() - cached.at < SUGGEST_TTL_MS) return i.respond(cached.choices).catch(() => {});
 
-  // У Discord на ответ 3 секунды — ждём поиск не дольше 2,3 сек
-  const res = await withTimeout(loadTracks(`scsearch:${typed}`, null), 2300);
+  // Сначала — оригиналы из каталога (без каверов и чужих загрузок)
+  const catalog = await catalogSearch(typed, 12, 1800).catch(() => null);
+  if (catalog?.length) {
+    const choices = [
+      ...asTyped,
+      ...catalog.map((c) => ({
+        name: truncate(`${c.artist} — ${c.title} (${formatDuration(c.durationMs)})`, 100),
+        value: `dz:${c.id}`,
+      })),
+    ].slice(0, 25);
+    suggestCache.set(key, { at: Date.now(), choices });
+    if (suggestCache.size > 500) suggestCache.delete(suggestCache.keys().next().value as string);
+    return i.respond(choices).catch(() => {});
+  }
+
+  // Каталог не ответил — запасной вариант: поиск SoundCloud. У Discord на ответ 3 секунды
+  const res = await withTimeout(loadTracks(`scsearch:${typed}`, null), 1000);
   const found = (res?.tracks ?? [])
     .filter((t) => t.info.isStream || (t.info.duration ?? 0) > PREVIEW_MAX_MS)
     .slice(0, 15)
@@ -494,21 +509,89 @@ function withAlternatives(main: Track, others: Track[]): Track {
   return main;
 }
 
-/** Ищет трек на SoundCloud; ранжирует варианты по длительности, неиграбельные пропускает. */
+// Слова, по которым узнаются каверы, ремиксы и прочие «не оригиналы»
+const JUNK_WORDS = /(cover|remix|flip|mash ?-?up|slowed|reverb|sped ?up|speed ?up|nightcore|karaoke|instrumental|\blive\b|\bedit\b|\b8d\b|bass ?boost|lo-?fi|acoustic|piano|tribute|8-?bit|кавер|ремикс|караоке|минус|медлен|ускор)/gi;
+const norm = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+/**
+ * Насколько загрузка похожа на оригинал: штраф за «cover/remix/slowed…» (если их не искали),
+ * бонус за совпадение автора загрузки с исполнителем, за название и за длительность.
+ */
+function originalScore(t: Track, artist: string, title: string, durationMs?: number): number {
+  const wanted = norm(`${artist} ${title}`);
+  const tTitle = t.info.title ?? '';
+  const nt = norm(tTitle);
+  const na = norm(artist);
+  const nTitle = norm(title);
+  const author = norm(t.info.author ?? '');
+  let s = 0;
+  const junk = (tTitle.match(JUNK_WORDS) ?? []).filter((w) => !wanted.includes(norm(w)));
+  s -= 40 * junk.length;
+  if (na && author && (author === na || author.includes(na) || na.includes(author))) s += 30; // аккаунт исполнителя
+  if (nTitle && nt.includes(nTitle)) s += 15;
+  if (na && nt.includes(na)) s += 5;
+  if (durationMs) {
+    const diff = Math.abs((t.info.duration ?? 0) - durationMs);
+    s += diff < 3_000 ? 25 : diff < 10_000 ? 15 : diff < 25_000 ? 5 : -20;
+  }
+  return s;
+}
+
+/** Ищет трек на SoundCloud и выбирает версию, больше всего похожую на оригинал. Неиграбельные пропускает. */
 async function findOnSoundCloud(artist: string, title: string, requester: unknown, durationMs?: number) {
   const q = `${artist} ${title}`.trim();
   if (!q) return undefined;
   const res = await loadTracks(`scsearch:${q}`, requester);
-  let ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri));
+  const ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri));
   if (!ok.length) return undefined;
-  if (durationMs) {
-    // Сначала варианты, близкие по длительности к оригиналу, потом остальные
-    const near = ok.filter((t) => Math.abs((t.info.duration ?? 0) - durationMs) < 25_000);
-    const far = ok.filter((t) => !near.includes(t));
-    near.sort((x, y) => Math.abs((x.info.duration ?? 0) - durationMs) - Math.abs((y.info.duration ?? 0) - durationMs));
-    ok = [...near, ...far];
-  }
-  return withAlternatives(ok[0], ok.slice(1));
+  const ranked = ok
+    .map((t, k) => ({ t, k, s: originalScore(t, artist, title, durationMs) }))
+    .sort((x, y) => y.s - x.s || x.k - y.k)
+    .map((x) => x.t);
+  return withAlternatives(ranked[0], ranked.slice(1));
+}
+
+// ───────────────────────── каталог Deezer: «настоящие» треки ─────────────────────────
+
+interface CatalogTrack {
+  id: number;
+  artist: string;
+  title: string;
+  durationMs: number;
+}
+
+const toCatalog = (t: any): CatalogTrack => ({
+  id: t.id,
+  artist: t.artist?.name ?? '',
+  title: t.title_short ?? t.title ?? '',
+  durationMs: (t.duration ?? 0) * 1000,
+});
+
+async function catalogSearch(q: string, limit = 10, timeoutMs = 2000): Promise<CatalogTrack[]> {
+  const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=${limit}`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const json: any = await res.json();
+  return (json?.data ?? []).map(toCatalog);
+}
+
+async function catalogTrack(id: number): Promise<CatalogTrack | undefined> {
+  const json: any = await deezer(`/track/${Math.floor(id)}`);
+  return json?.id ? toCatalog(json) : undefined;
+}
+
+/** Похоже ли, что найденный в каталоге трек — то, что человек и искал (а не случайное совпадение) */
+function catalogMatches(query: string, c: CatalogTrack): boolean {
+  const q = norm(query);
+  const t = norm(c.title);
+  return !!t && (q.includes(t) || t.includes(q));
+}
+
+/** Оригинал из каталога → лучшая версия на SoundCloud */
+async function playCatalog(c: CatalogTrack, requester: unknown): Promise<LoadResult> {
+  const t = await findOnSoundCloud(c.artist, c.title, requester, c.durationMs);
+  if (!t) return { kind: 'empty', tracks: [] };
+  return { kind: 'track', tracks: [t] };
 }
 
 /**
@@ -670,8 +753,26 @@ async function enqueue(
 
 async function play(i: ChatInputCommandInteraction<'cached'>) {
   const text = i.options.getString('query', true).trim();
-  const isUrl = /^https?:\/\//i.test(text);
-  return enqueue(i, () => (isUrl ? loadTracks(text, i.user) : searchByText(text, i.user)));
+  if (/^https?:\/\//i.test(text)) return enqueue(i, () => loadTracks(text, i.user));
+
+  // Выбран вариант из подсказок — играем именно его оригинал
+  const dz = text.match(/^dz:(\d+)$/)?.[1];
+  if (dz) {
+    return enqueue(i, async () => {
+      const c = await catalogTrack(Number(dz)).catch(() => undefined);
+      return c ? playCatalog(c, i.user) : { kind: 'empty', tracks: [] };
+    });
+  }
+
+  // Просто текст: сначала ищем оригинал в каталоге; если он не похож на запрос — обычный поиск SoundCloud
+  return enqueue(i, async () => {
+    const top = (await catalogSearch(text, 1, 4000).catch(() => []))[0];
+    if (top && catalogMatches(text, top)) {
+      const r = await playCatalog(top, i.user);
+      if (r.tracks.length) return r;
+    }
+    return searchByText(text, i.user);
+  });
 }
 
 async function playFile(i: ChatInputCommandInteraction<'cached'>) {
