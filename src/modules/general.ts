@@ -38,6 +38,7 @@ export async function onCommand(i: ChatInputCommandInteraction) {
           '`/volume` — громкость, `/shuffle` — перемешивание, `/loop` — повтор',
           '`/queue` — очередь, `/remove` — убрать трек, `/nowplaying` — показать плеер',
           '`/radio` или 📻 в плеере — радио по текущему треку: подбор Spotify, бот сам добавляет похожие',
+          '`/station` — интернет-радио: станции по жанрам, поиск по названию, ⭐ избранное сервера',
           '🎛 Меню под плеером — эффекты: Bass Boost, 8D, Nightcore, Slowed, Караоке, Lo-Fi',
         ].join('\n'),
       },

@@ -129,6 +129,7 @@ export function setup(client: Client) {
 
   manager.on('trackStart', (player: Player, track: any) => {
     void showPanel(client, player, true);
+    if (player.get('station')) return; // эфир не попадает в статистику и не запускает радио по треку
     try {
       if (track) recordPlay(track);
     } catch (e) {
@@ -140,6 +141,11 @@ export function setup(client: Client) {
     });
   });
   manager.on('queueEnd', (player: Player) => {
+    // Эфир оборвался — пусть модуль радио переподключит или переключит станцию
+    if (player.get('station')) {
+      stationEndHook?.(player, 'end');
+      return;
+    }
     // Сначала дозагружаем отложенные треки (плейлисты Spotify), потом радио
     if (lazyOf(player).length) {
       void topUp(player).then((n) => {
@@ -157,6 +163,10 @@ export function setup(client: Client) {
   });
   manager.on('trackError', (player: Player, track: any, payload: any) => {
     console.warn('[music] Ошибка трека:', track?.info?.title, payload?.exception?.message);
+    if (player.get('station')) {
+      stationEndHook?.(player, 'error');
+      return;
+    }
     void onTrackFailed(client, player, track)
       .catch((e) => console.warn('[music] Замена трека:', (e as Error).message))
       .finally(() => setTimeout(() => void keepGoing(player), 500));
@@ -240,6 +250,9 @@ export async function onCommand(i: ChatInputCommandInteraction) {
   const err = checkControl(member, player, i.commandName);
   if (err) return respond(i, err);
   const p = player!;
+  if (p.get('station') && ['skip', 'shuffle', 'loop', 'remove', 'radio'].includes(i.commandName)) {
+    return respond(i, '📻 Сейчас идёт радиостанция. Переключить — кнопка 🔀 «Другая станция» в плеере или `/station`; вернуться к трекам — `/play`.');
+  }
 
   switch (i.commandName) {
     case 'skip':
@@ -738,6 +751,12 @@ async function enqueue(
   }
   if (!player.connected) await player.connect();
 
+  // Если играла радиостанция — выключаем эфир, дальше обычная очередь
+  const wasStation = !!player.get('station');
+  if (wasStation) {
+    player.set('station', null);
+    player.set('stationNow', null);
+  }
   if (added.length) await player.queue.add(added);
   if (lazyItems.length) {
     if (player.get('shuffle')) lazyItems.sort(() => Math.random() - 0.5);
@@ -745,7 +764,8 @@ async function enqueue(
   }
   if (player.get('shuffle')) await player.queue.shuffle();
   if (lazyItems.length) await topUp(player);
-  if (!player.playing && !player.paused && player.queue.tracks.length) await player.play();
+  if (wasStation && player.queue.tracks.length) await player.skip(0, false);
+  else if (!player.playing && !player.paused && player.queue.tracks.length) await player.play();
   else await refreshPanel(player);
 
   return i.editReply(label);
@@ -832,7 +852,11 @@ const SOFT_EQ = [
   { band: 14, gain: -0.25 },
 ];
 
+/** Эффекты, меняющие скорость: в прямом эфире они вызывают заикания */
+const SPEED_FX = new Set(['nightcore', 'slowed']);
+
 async function applyFx(player: Player, key: string) {
+  if (player.get('station') && SPEED_FX.has(key)) throw new Error('в прямом эфире нельзя менять скорость — Nightcore и Slowed недоступны');
   const fm: any = (player as any).filterManager;
   if (!fm) throw new Error('эффекты недоступны в этой версии плеера');
   await fm.resetFilters();
@@ -864,11 +888,12 @@ async function applyFx(player: Player, key: string) {
 
 function fxMenu(player: Player) {
   const current = player.get('fx') ?? 'off';
+  const live = !!player.get('station');
   const menu = new StringSelectMenuBuilder()
     .setCustomId('music:fx')
     .setPlaceholder(`🎛 Эффект: ${FX[current]?.[0] ?? 'Без эффектов'}`)
     .addOptions(
-      Object.entries(FX).map(([key, [label, emoji, desc]]) =>
+      Object.entries(FX).filter(([key]) => !(live && SPEED_FX.has(key))).map(([key, [label, emoji, desc]]) =>
         new StringSelectMenuOptionBuilder().setValue(key).setLabel(label).setEmoji(emoji).setDescription(desc).setDefault(key === current),
       ),
     );
@@ -1189,7 +1214,53 @@ function progressBar(position: number, duration: number, size = 16) {
   return `${'▰'.repeat(filled)}${'▱'.repeat(size - filled)}  \`${formatDuration(position)} / ${formatDuration(duration)}\``;
 }
 
+/** Плеер в режиме радиостанции */
+function stationPanel(player: Player) {
+  const st: StationMeta = player.get('station');
+  const now: string | null = player.get('stationNow');
+  const fav = !!db.prepare('SELECT 1 FROM radio_favorites WHERE uuid = ?').get(st.uuid);
+  const mins = Math.max(0, Math.floor((Date.now() - (st.startedAt ?? Date.now())) / 60_000));
+  const onAir = mins >= 60 ? `${Math.floor(mins / 60)} ч ${mins % 60} мин` : `${mins} мин`;
+  const fx = player.get('fx');
+  const requester = (player.queue.current?.requester as any)?.id;
+
+  const embed = baseEmbed()
+    .setColor(0xe02b2b)
+    .setAuthor({ name: player.paused ? '⏸ ЭФИР НА ПАУЗЕ' : '🔴 ПРЯМОЙ ЭФИР' })
+    .setTitle(truncate(st.name, 250))
+    .setDescription(
+      [
+        [`${st.flag} ${st.country}`.trim(), st.genreLabel, st.bitrate ? `${st.bitrate} kbps` : '', st.codec].filter(Boolean).join(' · '),
+        '',
+        now ? `🎵 Сейчас в эфире: **${truncate(now, 200)}**` : '🎵 Станция не передаёт название трека',
+        `⏱ В эфире: ${onAir}`,
+      ].join('\n'),
+    )
+    .addFields({ name: 'Громкость', value: `${player.volume}%`, inline: true })
+    .setFooter({ text: `${fav ? '⭐ В избранном сервера • ' : ''}Каталог радиостанций Radio Browser` });
+  if (fx && fx !== 'off' && FX[fx]) embed.addFields({ name: 'Эффект', value: `${FX[fx][1]} ${FX[fx][0]}`, inline: true });
+  if (requester) embed.addFields({ name: 'Включил', value: `<@${requester}>`, inline: true });
+  if (st.homepage?.startsWith('http')) embed.setURL(st.homepage);
+  if (st.favicon?.startsWith('https://')) embed.setThumbnail(st.favicon);
+
+  const sbtn = (id: string, emoji: string, label: string, style = ButtonStyle.Secondary) =>
+    new ButtonBuilder().setCustomId(`station:${id}`).setEmoji(emoji).setLabel(label).setStyle(style);
+  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    btn('toggle', player.paused ? '▶️' : '⏸', ButtonStyle.Primary),
+    btn('stop', '⏹', ButtonStyle.Danger),
+    btn('voldown', '🔉'),
+    btn('volup', '🔊'),
+  );
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    sbtn('fav', '⭐', fav ? 'В избранном' : 'В избранное', fav ? ButtonStyle.Success : ButtonStyle.Secondary),
+    sbtn('next', '🔀', 'Другая станция'),
+    sbtn('list', '📻', 'Список'),
+  );
+  return { embeds: [embed], components: [row1, row2, fxMenu(player)] };
+}
+
 function panelPayload(player: Player) {
+  if (player.get('station') && player.queue.current) return stationPanel(player);
   const track = player.queue.current;
   if (!track) {
     return {
@@ -1394,3 +1465,95 @@ async function notify(client: Client, player: Player, text: string) {
 export function hasPlayer(guild: Guild) {
   return !!manager?.getPlayer(guild.id);
 }
+
+
+// ───────────────────────── API для модуля радиостанций ─────────────────────────
+
+export interface StationMeta {
+  uuid: string;
+  name: string;
+  url: string;
+  homepage?: string;
+  favicon?: string;
+  flag: string;
+  country: string;
+  genreKey?: string;
+  genreLabel: string;
+  bitrate?: number;
+  codec?: string;
+  startedAt?: number;
+}
+
+let stationEndHook: ((player: Player, reason: 'end' | 'error') => void) | null = null;
+
+/**
+ * Включает радиостанцию: очередь очищается, радио по треку и отложенные треки выключаются.
+ * Поток сначала открывает Lavalink — это и есть проверка, что станция живая и отдаёт звук.
+ * Возвращает текст ошибки или null.
+ */
+async function startStation(
+  guildId: string,
+  voiceChannelId: string,
+  textChannelId: string,
+  requester: { id: string; username: string },
+  meta: StationMeta,
+): Promise<string | null> {
+  let player = manager.getPlayer(guildId);
+  if (player && player.voiceChannelId !== voiceChannelId) {
+    if (player.queue.current) return `🎶 Я уже играю в <#${player.voiceChannelId}>. Заходи туда!`;
+    await player.destroy('move');
+    player = undefined;
+  }
+
+  const res = await withTimeout(loadTracks(meta.url, requester), 12_000);
+  const tr = res?.tracks[0];
+  if (!tr) return res?.kind === 'error' ? `станция не отдаёт звук (${truncate(res.error ?? '', 120)})` : 'станция не отвечает';
+  (tr.info as any).title = meta.name;
+  (tr.info as any).author = meta.genreLabel;
+  if (meta.favicon?.startsWith('https://')) (tr.info as any).artworkUrl = meta.favicon;
+
+  if (!player) {
+    player = manager.createPlayer({
+      guildId,
+      voiceChannelId,
+      textChannelId: getSetting('channel.music') ?? textChannelId,
+      selfDeaf: true,
+      selfMute: false,
+      volume: config.defaultVolume,
+    });
+  }
+  if (!player.connected) await player.connect();
+
+  // Сброс обычных режимов
+  if (player.repeatMode !== 'off') await player.setRepeatMode('off');
+  player.set('radio', false);
+  player.set('lazy', []);
+  player.set('radioPending', []);
+  if (SPEED_FX.has(player.get('fx'))) await applyFx(player, 'off').catch(() => {});
+  player.set('station', { ...meta, startedAt: Date.now() });
+  player.set('stationNow', null);
+
+  if (player.queue.tracks.length) await player.queue.splice(0, player.queue.tracks.length);
+  if (player.queue.current && (player.playing || player.paused)) {
+    await player.queue.add(tr, 0);
+    await player.skip(0, false);
+    if (player.paused) await player.resume();
+  } else {
+    await player.queue.add(tr);
+    await player.play();
+  }
+  return null;
+}
+
+export const musicApi = {
+  getPlayer: (guildId: string) => manager?.getPlayer(guildId),
+  players: (): Player[] => [...((manager as any)?.players?.values?.() ?? [])],
+  checkControl,
+  panelPayload,
+  refreshPanel,
+  startStation,
+  notify: (player: Player, text: string) => (botClient ? notify(botClient, player, text) : Promise.resolve()),
+  setStationEndHook: (fn: (player: Player, reason: 'end' | 'error') => void) => {
+    stationEndHook = fn;
+  },
+};
