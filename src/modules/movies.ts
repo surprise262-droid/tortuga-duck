@@ -38,10 +38,10 @@ interface MoviesConfig {
 const DEFAULTS: MoviesConfig = {
   language: 'ru-RU',
   days: 60,
-  moviesMax: 20,
-  seriesMax: 20,
-  movieMinPopularity: 15,
-  seriesMinPopularity: 20,
+  moviesMax: 25,
+  seriesMax: 25,
+  movieMinPopularity: 4,
+  seriesMinPopularity: 8,
   announceMinPopularity: 60,
   intervalMinutes: 180,
 };
@@ -137,10 +137,10 @@ async function genres(language: string) {
 /** Фильмы: мировая дата премьеры в ближайшие N дней, самые популярные */
 async function fetchMovies(cfg: MoviesConfig): Promise<Entry[]> {
   const g = await genres(cfg.language);
-  const from = ymd(new Date(Date.now() - DAY));
+  const from = ymd(new Date());
   const to = ymd(new Date(Date.now() + cfg.days * DAY));
   const out: Entry[] = [];
-  for (let page = 1; page <= 3; page++) {
+  for (let page = 1; page <= 5; page++) {
     const j = await tmdb('/discover/movie', {
       language: cfg.language,
       sort_by: 'popularity.desc',
@@ -168,7 +168,27 @@ async function fetchMovies(cfg: MoviesConfig): Promise<Entry[]> {
     }
     if (page >= (j?.total_pages ?? 1)) break;
   }
-  return out.sort((a, b) => b.popularity - a.popularity).slice(0, cfg.moviesMax);
+  const top = out.sort((a, b) => b.popularity - a.popularity).slice(0, cfg.moviesMax);
+  await fixForeignTitles(top);
+  return top;
+}
+
+/** Если у названия нет перевода и оно не кириллицей/латиницей (хинди, китайский…) — берём английское */
+const readable = (t: string) => /^[\p{Script=Latin}\p{Script=Cyrillic}\p{N}\p{P}\p{S}\s]+$/u.test(t);
+async function fixForeignTitles(items: Entry[]) {
+  for (const x of items) {
+    if (readable(x.title)) continue;
+    try {
+      const j = await tmdb(`/${x.kind}/${x.id}`, { language: 'en-US' });
+      const en = x.kind === 'movie' ? j?.title : j?.name;
+      if (en && readable(en)) {
+        x.original = x.original ?? x.title;
+        x.title = en;
+      }
+    } catch {
+      /* оставим как есть */
+    }
+  }
 }
 
 /**
@@ -178,28 +198,38 @@ async function fetchMovies(cfg: MoviesConfig): Promise<Entry[]> {
 async function fetchSeries(cfg: MoviesConfig): Promise<Entry[]> {
   const g = await genres(cfg.language);
   const now = Date.now();
-  const from = ymd(new Date(now - DAY));
+  const from = ymd(new Date());
   const to = ymd(new Date(now + cfg.days * DAY));
-  const candidates: any[] = [];
-  for (let page = 1; page <= 3; page++) {
-    const j = await tmdb('/discover/tv', {
-      language: cfg.language,
-      sort_by: 'popularity.desc',
-      include_adult: 'false',
-      'air_date.gte': from,
-      'air_date.lte': to,
-      page,
-    });
-    candidates.push(...(j?.results ?? []).filter((t: any) => (t.popularity ?? 0) >= cfg.seriesMinPopularity));
-    if (page >= (j?.total_pages ?? 1)) break;
-  }
+  // Без ток-шоу, новостей, мыльных опер и реалити — они забивают верх популярности, а премьер сезонов у них нет
+  const without = '10763,10764,10766,10767';
 
+  const byId = new Map<number, any>();
+  const collect = async (params: Record<string, string | number>, pages: number) => {
+    for (let page = 1; page <= pages; page++) {
+      const j = await tmdb('/discover/tv', {
+        language: cfg.language,
+        sort_by: 'popularity.desc',
+        include_adult: 'false',
+        without_genres: without,
+        ...params,
+        page,
+      });
+      for (const t of j?.results ?? []) if ((t.popularity ?? 0) >= cfg.seriesMinPopularity && !byId.has(t.id)) byId.set(t.id, t);
+      if (page >= (j?.total_pages ?? 1)) break;
+    }
+  };
+  // 1) Совсем новые сериалы: первый эпизод в окне
+  await collect({ 'first_air_date.gte': from, 'first_air_date.lte': to }, 3);
+  // 2) Сериалы, у которых в окне выходят эпизоды — среди них ищем премьеры новых сезонов
+  await collect({ 'air_date.gte': from, 'air_date.lte': to }, 6);
+
+  const candidates = [...byId.values()].sort((a, b) => b.popularity - a.popularity).slice(0, 90);
   const out: Entry[] = [];
-  // Проверяем самые популярные: у кого следующий эпизод — первый в сезоне
-  for (const t of candidates.slice(0, 45)) {
+  for (const t of candidates) {
     try {
       const d = await tmdb(`/tv/${t.id}`, { language: cfg.language });
       const next = d?.next_episode_to_air;
+      // Премьера = первый эпизод сезона в ближайшие N дней
       if (!next?.air_date || next.episode_number !== 1) continue;
       const date = new Date(`${next.air_date}T00:00:00Z`);
       if (date.getTime() < now - DAY || date.getTime() > now + cfg.days * DAY) continue;
@@ -222,9 +252,12 @@ async function fetchSeries(cfg: MoviesConfig): Promise<Entry[]> {
     } catch (e) {
       console.warn(`[movies] Сериал ${t.id}:`, (e as Error).message);
     }
-    await sleep(120); // бережно к лимитам TMDB
+    await sleep(80); // бережно к лимитам TMDB
   }
-  return out.sort((a, b) => b.popularity - a.popularity).slice(0, cfg.seriesMax);
+  console.log(`[movies] Сериалов-кандидатов: ${candidates.length}, премьер найдено: ${out.length}`);
+  const top = out.sort((a, b) => b.popularity - a.popularity).slice(0, cfg.seriesMax);
+  await fixForeignTitles(top);
+  return top;
 }
 
 async function fetchAll(cfg: MoviesConfig) {
