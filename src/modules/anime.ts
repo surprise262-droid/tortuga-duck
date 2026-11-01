@@ -208,7 +208,8 @@ const shortDate = (d: Date) =>
   d.getUTCDate() === 1
     ? `~${MONTHS_SHORT[d.getUTCMonth()]}`
     : `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-const linkOf = (a: ShikiAnime & { base: string }) => `${a.base}${a.url}`;
+// Короткая ссылка: Shikimori открывает тайтл и по одному номеру — экономим место (лимит Discord 6000 символов)
+const linkOf = (a: ShikiAnime & { base: string }) => `${a.base}/animes/${a.id}`;
 const imageOf = (a: ShikiAnime & { base: string }) => {
   const p = a.image?.original ?? a.image?.preview;
   if (!p || p.includes('missing')) return undefined;
@@ -309,15 +310,22 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
     if (current && text) current.setDescription(text.trimEnd());
   };
   let total = 0;
+  let skipped = 0;
   for (const { a, d } of upcoming) {
     const m = `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
     const dd = shortDate(d);
     const line = `\`${dd}\` [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind}\n`;
     // Discord: до 10 embed'ов и ~6000 символов на сообщение, описание до 4096
-    if (total + line.length > 5200) break;
-    if (m !== month || text.length + line.length > 3900) {
+    if (total + line.length > 4300) {
+      skipped++;
+      continue;
+    }
+    if (m !== month || text.length + line.length > 3500) {
       flush();
-      if (embeds.length >= 10) break;
+      if (embeds.length >= 10) {
+        skipped++;
+        continue;
+      }
       current = new EmbedBuilder().setColor(0xeb459e).setTitle(m !== month ? m : `${m} (продолжение)`);
       embeds.push(current);
       text = '';
@@ -327,6 +335,7 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
     total += line.length;
   }
   flush();
+  if (skipped) header.setFooter({ text: `Не поместились ещё ${skipped} (лимит Discord) • Обновляется автоматически` });
   return embeds;
 }
 

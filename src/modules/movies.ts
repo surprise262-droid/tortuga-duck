@@ -164,7 +164,7 @@ async function fetchMovies(cfg: MoviesConfig): Promise<Entry[]> {
         popularity: m.popularity,
         overview: m.overview,
         poster: posterUrl(m.poster_path),
-        link: `https://www.themoviedb.org/movie/${m.id}?language=ru`,
+        link: `https://themoviedb.org/movie/${m.id}`,
         genres: (m.genre_ids ?? []).map((id: number) => g.movie.get(id)).filter(Boolean).slice(0, 3).join(', '),
       });
     }
@@ -247,7 +247,7 @@ async function fetchSeries(cfg: MoviesConfig): Promise<Entry[]> {
         popularity: t.popularity,
         overview: next.overview || d.overview,
         poster: posterUrl(d.seasons?.find((s: any) => s.season_number === next.season_number)?.poster_path ?? d.poster_path),
-        link: `https://www.themoviedb.org/tv/${t.id}?language=ru`,
+        link: `https://themoviedb.org/tv/${t.id}`,
         note: `${isNew ? 'новый сериал' : `${next.season_number} сезон`}${network ? ` · ${network}` : ''}`,
         genres: (t.genre_ids ?? []).map((id: number) => g.tv.get(id)).filter(Boolean).slice(0, 3).join(', '),
       });
@@ -417,7 +417,8 @@ function listText(items: Entry[], empty: string): string {
     .map((x) => `\`${dd(x.date)}\` [${truncate(x.title, 55).replace(/[[\]]/g, '')}](${x.link})${x.note ? ` · ${x.note}` : ''}`);
   let text = '';
   for (const l of lines) {
-    if (text.length + l.length + 1 > 3900) break;
+    // Два списка в одном сообщении, а лимит Discord — 6000 символов на всё: каждому не больше ~2300
+    if (text.length + l.length + 1 > 2300) break;
     text += `${l}\n`;
   }
   return text.trimEnd();

@@ -265,7 +265,12 @@ async function run(client: Client): Promise<string> {
 // ───────────────────────── оформление ─────────────────────────
 
 const steamUrl = (g: IgdbGame) => g.external_games?.find((e) => e.url?.includes('store.steampowered.com'))?.url;
-const linkOf = (g: IgdbGame) => steamUrl(g) ?? g.url ?? `https://www.igdb.com/games/${g.id}`;
+/** Короткие ссылки (лимит Discord 6000 символов на сообщение): Steam — без названия в адресе */
+const linkOf = (g: IgdbGame) => {
+  const steam = steamUrl(g)?.match(/store\.steampowered\.com\/app\/(\d+)/)?.[1];
+  if (steam) return `https://store.steampowered.com/app/${steam}`;
+  return g.url ?? `https://www.igdb.com/games/${g.id}`;
+};
 const coverOf = (g: IgdbGame) =>
   g.cover?.image_id ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${g.cover.image_id}.jpg` : undefined;
 const dateOf = (g: IgdbGame) => new Date((g.first_release_date ?? 0) * 1000);
@@ -368,8 +373,8 @@ function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
     const plats = platformsOf(g);
     const line = `[${truncate(g.name, 55).replace(/[[\]]/g, '')}](${linkOf(g)})${plats ? ` · ${plats}` : ''}${g.hypes ? ` · ${hypeText(g.hypes)}` : ''}\n`;
     const chunk = dayLine + line;
-    if (total + chunk.length > 5300) break; // лимит Discord ~6000 символов на сообщение
-    if (!current || text.length + chunk.length > 3900) {
+    if (total + chunk.length > 4300) break; // лимит Discord 6000 символов на всё сообщение — держим запас
+    if (!current || text.length + chunk.length > 3500) {
       flush();
       if (embeds.length >= 10) break;
       current = new EmbedBuilder().setColor(COLOR);
