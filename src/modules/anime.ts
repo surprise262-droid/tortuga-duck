@@ -9,7 +9,7 @@ import {
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
 import { trailerButtonRow, trailerMenus } from '../trailerUi';
-import { upsertPinned } from '../calendarMsg';
+import { calendarUrl, cardComponents, upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -181,7 +181,7 @@ async function run(client: Client): Promise<string> {
       for (const a of fresh) {
         try {
           const video = await animeVideo(a.id).catch(() => undefined);
-          await channel.send({ embeds: [announceEmbed(a)], components: video ? [trailerButtonRow('shiki', a.id)] : [] });
+          await channel.send({ embeds: [announceEmbed(a)], components: cardComponents(video ? trailerButtonRow('shiki', a.id) : null, calendarUrl(channel, 'anime.calendar_msg')) });
           posted++;
         } catch (e) {
           console.warn('[anime] Не отправился анонс:', (e as Error).message);
@@ -288,6 +288,25 @@ export async function animeTrailer(id: number): Promise<{ title: string; url?: s
   return { title, url };
 }
 
+const RECENT_DAYS = 30;
+const RECENT_MAX = 15;
+
+/** Анонсы последних 30 дней, которых нет в основном календаре. Тайтлы, запомненные при первом запуске, не считаются новыми. */
+function recentOutside(list: (ShikiAnime & { base: string })[], inCalendar: number[]) {
+  const rows = db.prepare('SELECT guid, ts FROM news_seen WHERE feed = ?').all(FEED_KEY) as { guid: string; ts: number }[];
+  if (!rows.length) return [];
+  const firstSeen = new Map(rows.map((r) => [r.guid, r.ts]));
+  const seedTs = Math.min(...rows.map((r) => r.ts));
+  const skip = new Set(inCalendar);
+  const since = Date.now() - RECENT_DAYS * 24 * 3600_000;
+  return list
+    .filter((a) => !skip.has(a.id))
+    .map((a) => ({ a, ts: firstSeen.get(String(a.id)) ?? 0, d: dateRu(a.aired_on) }))
+    .filter((x) => x.ts > seedTs + 10 * 60_000 && x.ts >= since)
+    .sort((x, y) => y.ts - x.ts)
+    .slice(0, RECENT_MAX);
+}
+
 function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfig) {
   const upcoming = upcomingOf(list, cfg);
 
@@ -335,6 +354,21 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
     total += line.length;
   }
   flush();
+
+  // 🆕 Недавно анонсированы: без даты или с премьерой позже окна календаря (30 дней с анонса, до 15 строк)
+  const recent = recentOutside(list, upcoming.map((x) => x.a.id));
+  if (recent.length) {
+    const lines = recent.map(({ a, d }) => {
+      const when = d ? `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCFullYear()}` : 'дата не объявлена';
+      return `• [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind} — ${when}`;
+    });
+    embeds.push(
+      new EmbedBuilder()
+        .setColor(0xeb459e)
+        .setTitle('🆕 Недавно анонсированы')
+        .setDescription(`Премьера пока без даты или позже, чем через ${cfg.calendarDays} дней. Держатся здесь ${RECENT_DAYS} дней с анонса.\n\n${lines.join('\n')}`),
+    );
+  }
   if (skipped) header.setFooter({ text: `Не поместились ещё ${skipped} (лимит Discord) • Обновляется автоматически` });
   return embeds;
 }

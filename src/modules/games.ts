@@ -9,7 +9,7 @@ import {
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
 import { trailerButtonRow, trailerMenus } from '../trailerUi';
-import { upsertPinned } from '../calendarMsg';
+import { calendarUrl, cardComponents, upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -243,7 +243,7 @@ async function run(client: Client): Promise<string> {
         try {
           await channel.send({
             embeds: [announceEmbed(g)],
-            components: bestVideo(g.videos) ? [trailerButtonRow('igdb', g.id)] : [],
+            components: cardComponents(bestVideo(g.videos) ? trailerButtonRow('igdb', g.id) : null, calendarUrl(channel, 'games.calendar_msg')),
           });
           posted++;
         } catch (e) {

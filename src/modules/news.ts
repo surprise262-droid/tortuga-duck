@@ -53,7 +53,11 @@ const seen = {
   count: (feed: string) => (db.prepare('SELECT COUNT(*) AS n FROM news_seen WHERE feed = ?').get(feed) as { n: number }).n,
   add: (feed: string, guid: string) =>
     db.prepare('INSERT OR IGNORE INTO news_seen (feed, guid, ts) VALUES (?, ?, ?)').run(feed, guid, Date.now()),
-  cleanup: () => db.prepare('DELETE FROM news_seen WHERE ts < ?').run(Date.now() - 60 * 24 * 60 * 60_000),
+  // Только ленты новостей: списки анонсов (аниме, игры, кино) хранятся бессрочно, иначе старые анонсы пришли бы повторно
+  cleanup: () =>
+    db
+      .prepare("DELETE FROM news_seen WHERE ts < ? AND feed NOT IN ('shiki:anons', 'igdb:upcoming', 'tmdb:upcoming')")
+      .run(Date.now() - 60 * 24 * 60 * 60_000),
 };
 
 export const commands = [

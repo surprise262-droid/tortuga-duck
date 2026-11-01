@@ -1,4 +1,4 @@
-import { MessageType } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageType } from 'discord.js';
 import { getSetting, setSetting } from './db';
 
 /**
@@ -100,4 +100,18 @@ export async function upsertPinned(channel: any, settingKey: string, payload: { 
   if (!pinned) console.warn(`[${tag}] Не удалось закрепить календарь (нужно право «Управлять сообщениями»)`);
   await cleanupPinNotices(channel);
   return `Календарь ${oldIds.length ? 'отправлен заново' : 'создан'} (${sent.length} сообщ.)${pinned ? ' и закреплён' : ', но не закреплён — нет права «Управлять сообщениями»'}.`;
+}
+
+/** Ссылка на первое сообщение закреплённого календаря (или null, если его ещё нет) */
+export function calendarUrl(channel: any, settingKey: string): string | null {
+  const id = savedIds(settingKey)[0];
+  if (!id || !channel?.guildId) return null;
+  return `https://discord.com/channels/${channel.guildId}/${channel.id}/${id}`;
+}
+
+/** Кнопки под карточкой анонса: «▶️ Трейлер» (если есть) и «📅 Календарь» (ссылка на закреплённый календарь) */
+export function cardComponents(trailerRow: ActionRowBuilder<ButtonBuilder> | null, calUrl: string | null) {
+  const row = trailerRow ?? new ActionRowBuilder<ButtonBuilder>();
+  if (calUrl) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(calUrl).setEmoji('📅').setLabel('Календарь'));
+  return row.components.length ? [row] : [];
 }
