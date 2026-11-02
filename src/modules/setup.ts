@@ -27,6 +27,7 @@ export const CHANNEL_PURPOSES: [string, string, boolean][] = [
   ['anime_announce', 'Аниме: анонсы и календарь', false],
   ['games_announce', 'Игры: релизы и календарь', false],
   ['movies_announce', 'Кино и сериалы: премьеры и календарь', false],
+  ['reminders', 'Напоминания о премьерах (личные ветки)', false],
 ];
 
 const ROLE_PURPOSES: [string, string][] = [

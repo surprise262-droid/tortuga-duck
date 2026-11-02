@@ -8,8 +8,9 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
-import { trailerButtonRow, trailerMenus } from '../trailerUi';
-import { calendarUrl, cardComponents, upsertPinned } from '../calendarMsg';
+import { cardButtons, pickMenus } from '../trailerUi';
+import { registerCalendar, registerInfo, watchBadge, type PremiereInfo } from '../premiere';
+import { calendarUrl, upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -73,7 +74,17 @@ export const commands = [
 
 let running = false;
 
+/** Последний список релизов — чтобы перерисовать календарь после отметки «Буду играть» без запросов к API */
+let lastList: IgdbGame[] | null = null;
+
 export function setup(client: Client) {
+  registerInfo('igdb', (id) => gameInfo(Number(id)));
+  registerCalendar('igdb', async () => {
+    const channelId = getSetting('channel.games_announce');
+    if (!channelId || !lastList) return;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel?.isTextBased()) await updateCalendar(channel as any, lastList, loadCfg());
+  });
   client.once(Events.ClientReady, () => void run(client));
   setInterval(() => void run(client), Math.max(30, loadCfg().intervalMinutes) * 60_000);
 }
@@ -243,7 +254,7 @@ async function run(client: Client): Promise<string> {
         try {
           await channel.send({
             embeds: [announceEmbed(g)],
-            components: cardComponents(bestVideo(g.videos) ? trailerButtonRow('igdb', g.id) : null, calendarUrl(channel, 'games.calendar_msg')),
+            components: cardButtons('igdb', g.id, !!bestVideo(g.videos), calendarUrl(channel, 'games.calendar_msg')),
           });
           posted++;
         } catch (e) {
@@ -254,6 +265,7 @@ async function run(client: Client): Promise<string> {
       notable.forEach((g) => seen.add(g.id));
     }
 
+    lastList = list;
     const calStatus = await updateCalendar(channel, list, cfg);
     if (posted) console.log(`[games] Новых релизов в календаре: ${posted}`);
     return `✅ IGDB: ${list.length} релизов на ${cfg.calendarDays} дней. Новых карточек: ${posted}. ${calStatus}`;
@@ -334,13 +346,11 @@ function pickGames(list: IgdbGame[], cfg: GamesConfig) {
 
 /** Меню «▶️ Трейлер к игре…» — только для игр, у которых есть видео */
 function calendarComponents(list: IgdbGame[], cfg: GamesConfig) {
-  const items = pickGames(list, cfg)
-    .filter((g) => bestVideo(g.videos))
-    .map((g) => {
+  const items = pickGames(list, cfg).map((g) => {
       const d = dateOf(g);
       return { source: 'igdb' as const, id: g.id, title: g.name, hint: `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}${platformsOf(g) ? ` · ${platformsOf(g)}` : ''}` };
     });
-  return trailerMenus(items, '▶️ Трейлер к игре…', 'games', 2);
+  return pickMenus(items, '🎯 Выбрать игру: трейлер, «буду играть», напомнить…', 'games', 2);
 }
 
 function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
@@ -351,7 +361,7 @@ function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
     .setTitle('🗓 Календарь релизов игр')
     .setDescription(
       picked.length
-        ? `Самые ожидаемые релизы на ${cfg.calendarDays} дней, все платформы. Название — ссылка на Steam (или IGDB). 🔥 — сколько людей ждут игру.`
+        ? `Самые ожидаемые релизы на ${cfg.calendarDays} дней, все платформы. Название — ссылка на Steam (или IGDB). 🔥 — сколько людей в мире ждут игру, 👀 — сколько с нашего сервера. Отметиться и включить напоминание — в меню под календарём.`
         : 'В ближайшее время заметных релизов нет.',
     )
     .setTimestamp(new Date())
@@ -371,7 +381,7 @@ function calendarEmbeds(list: IgdbGame[], cfg: GamesConfig) {
     const dayKey = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
     const dayLine = dayKey !== lastDay ? `\n**${WEEKDAYS[d.getUTCDay()]}, ${dayKey}**\n` : '';
     const plats = platformsOf(g);
-    const line = `[${truncate(g.name, 55).replace(/[[\]]/g, '')}](${linkOf(g)})${plats ? ` · ${plats}` : ''}${g.hypes ? ` · ${hypeText(g.hypes)}` : ''}\n`;
+    const line = `[${truncate(g.name, 55).replace(/[[\]]/g, '')}](${linkOf(g)})${plats ? ` · ${plats}` : ''}${g.hypes ? ` · ${hypeText(g.hypes)}` : ''}${watchBadge('igdb', g.id)}\n`;
     const chunk = dayLine + line;
     if (total + chunk.length > 4300) break; // лимит Discord 6000 символов на всё сообщение — держим запас
     if (!current || text.length + chunk.length > 3500) {
@@ -393,4 +403,43 @@ async function updateCalendar(channel: any, list: IgdbGame[], cfg: GamesConfig):
   const embeds = calendarEmbeds(list, cfg);
   const components = calendarComponents(list, cfg);
   return upsertPinned(channel, 'games.calendar_msg', { embeds, components }, 'games');
+}
+
+
+// ───────────────────────── «Буду играть» и напоминания ─────────────────────────
+
+/** Данные о релизе для мини-карточки и напоминания */
+export async function gameInfo(id: number): Promise<PremiereInfo | null> {
+  if (credentialsMissing()) return null;
+  const [g] = await igdb(
+    'games',
+    `fields name,url,first_release_date,summary,cover.image_id,artworks.image_id,screenshots.image_id,genres.name,platforms.abbreviation,platforms.name,external_games.url,hypes;
+     where id = ${Math.floor(id)};`,
+  );
+  if (!g) return null;
+  const img = (size: string, imageId?: string) => (imageId ? `https://images.igdb.com/igdb/image/upload/${size}/${imageId}.jpg` : undefined);
+  const date = g.first_release_date ? new Date(g.first_release_date * 1000) : null;
+  const fields: PremiereInfo['fields'] = [];
+  const plats = platformsOf(g);
+  if (plats) fields.push({ name: 'Платформы', value: plats, inline: true });
+  const genres = (g.genres ?? []).map((x: any) => x.name).slice(0, 3).join(', ');
+  if (genres) fields.push({ name: 'Жанры', value: genres, inline: true });
+  if (g.hypes) fields.push({ name: 'Ждут в мире', value: hypeText(g.hypes), inline: true });
+  const steam = steamUrl(g);
+  return {
+    source: 'igdb',
+    id: String(g.id),
+    title: g.name,
+    date: date ? date.toISOString().slice(0, 10) : null,
+    // IGDB ставит 31 декабря, когда известен только год
+    approx: !!date && date.getUTCMonth() === 11 && date.getUTCDate() === 31,
+    released: !!date && date.getTime() <= Date.now(),
+    description: g.summary ? truncate(g.summary, 350) : undefined,
+    image: img('t_screenshot_big', g.artworks?.[0]?.image_id ?? g.screenshots?.[0]?.image_id) ?? coverOf(g),
+    thumb: coverOf(g),
+    color: COLOR,
+    kindLabel: 'Игра',
+    fields,
+    link: steam ? { label: 'Steam', url: linkOf(g) } : { label: 'IGDB', url: linkOf(g) },
+  };
 }

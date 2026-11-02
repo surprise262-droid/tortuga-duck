@@ -52,3 +52,35 @@ export function trailerMenus(items: TrailerItem[], placeholder: string, menuId: 
   }
   return rows;
 }
+
+/**
+ * Кнопки под карточкой анонса: ▶️ Трейлер (если есть) · 👀 Буду смотреть · N · 🔔 Напомнить · 📅 Календарь.
+ * Счётчик «Буду смотреть» общий для сервера, «Напомнить» — личное (никому не видно).
+ */
+export function cardButtons(source: TrailerSource, id: number | string, hasTrailer: boolean, calendarUrl: string | null, watchCount = 0) {
+  const verb = source === 'igdb' ? 'Буду играть' : 'Буду смотреть';
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (hasTrailer) row.addComponents(new ButtonBuilder().setCustomId(`trailer:${source}:${id}`).setLabel('Трейлер').setEmoji('▶️').setStyle(ButtonStyle.Secondary));
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(`watch:w:${source}:${id}`)
+      .setLabel(watchCount ? `${verb} · ${watchCount}` : verb)
+      .setEmoji('👀')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`watch:r:${source}:${id}`).setLabel('Напомнить').setEmoji('🔔').setStyle(ButtonStyle.Secondary),
+  );
+  if (calendarUrl) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(calendarUrl).setEmoji('📅').setLabel('Календарь'));
+  return [row];
+}
+
+/**
+ * Меню «Выбрать тайтл» под календарём: выбор открывает личную мини-карточку
+ * с трейлером, «Буду смотреть» и «Напомнить» (обрабатывает modules/watchlist.ts).
+ */
+export function pickMenus(items: TrailerItem[], placeholder: string, menuId: string, maxMenus = 2) {
+  return trailerMenus(items, placeholder, menuId, maxMenus).map((row) => {
+    const menu = row.components[0];
+    menu.setCustomId(menu.data.custom_id!.replace(/^trailer:menu:/, 'watch:pick:'));
+    return row;
+  });
+}

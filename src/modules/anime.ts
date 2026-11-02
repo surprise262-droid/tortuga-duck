@@ -8,8 +8,9 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
-import { trailerButtonRow, trailerMenus } from '../trailerUi';
-import { calendarUrl, cardComponents, upsertPinned } from '../calendarMsg';
+import { cardButtons, pickMenus } from '../trailerUi';
+import { registerCalendar, registerInfo, watchBadge, type PremiereInfo } from '../premiere';
+import { calendarUrl, upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -78,7 +79,17 @@ export const commands = [
 
 let running = false;
 
+/** Последний список анонсов — чтобы перерисовать календарь после отметки «Буду смотреть» без запросов к API */
+let lastList: (ShikiAnime & { base: string })[] | null = null;
+
 export function setup(client: Client) {
+  registerInfo('shiki', (id) => animeInfo(Number(id)));
+  registerCalendar('shiki', async () => {
+    const channelId = getSetting('channel.anime_announce');
+    if (!channelId || !lastList) return;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel?.isTextBased()) await updateCalendar(channel as any, lastList, loadCfg());
+  });
   client.once(Events.ClientReady, () => void run(client));
   const minutes = Math.max(15, loadCfg().intervalMinutes);
   setInterval(() => void run(client), minutes * 60_000);
@@ -181,7 +192,7 @@ async function run(client: Client): Promise<string> {
       for (const a of fresh) {
         try {
           const video = await animeVideo(a.id).catch(() => undefined);
-          await channel.send({ embeds: [announceEmbed(a)], components: cardComponents(video ? trailerButtonRow('shiki', a.id) : null, calendarUrl(channel, 'anime.calendar_msg')) });
+          await channel.send({ embeds: [announceEmbed(a)], components: cardButtons('shiki', a.id, !!video, calendarUrl(channel, 'anime.calendar_msg')) });
           posted++;
         } catch (e) {
           console.warn('[anime] Не отправился анонс:', (e as Error).message);
@@ -191,6 +202,7 @@ async function run(client: Client): Promise<string> {
       list.filter((a) => !seen.has(a.id)).forEach((a) => seen.add(a.id));
     }
 
+    lastList = list;
     const calStatus = await updateCalendar(channel as any, list, cfg);
     if (posted) console.log(`[anime] Новых анонсов: ${posted}`);
     return `✅ Shikimori: ${list.length} анонсов. Новых опубликовано: ${posted}. ${calStatus}`;
@@ -263,7 +275,16 @@ function calendarComponents(list: (ShikiAnime & { base: string })[], cfg: AnimeC
     title: titleOf(a),
     hint: `${shortDate(d)} · ${KIND_RU[a.kind ?? ''] ?? a.kind ?? ''}`,
   }));
-  return trailerMenus(items, '▶️ Трейлер к аниме…', 'anime', 2);
+  const recent = recentOutside(list, upcomingOf(list, cfg).map((x) => x.a.id)).map(({ a, d }) => ({
+    source: 'shiki' as const,
+    id: a.id,
+    title: titleOf(a),
+    hint: `🆕 ${d ? `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCFullYear()}` : 'дата не объявлена'} · ${KIND_RU[a.kind ?? ''] ?? a.kind ?? ''}`,
+  }));
+  return [
+    ...pickMenus(items, '🎯 Выбрать аниме: трейлер, «буду смотреть», напомнить…', 'anime', 2),
+    ...pickMenus(recent, '🆕 Недавно анонсированные…', 'anime_new', 1),
+  ];
 }
 
 /** Видео тайтла на Shikimori: PV/трейлер с YouTube */
@@ -315,7 +336,7 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
     .setTitle('🗓 Календарь аниме-анонсов')
     .setDescription(
       upcoming.length
-        ? `Ближайшие премьеры на ${cfg.calendarDays} дней. Нажми на название — откроется страница на Shikimori.`
+        ? `Ближайшие премьеры на ${cfg.calendarDays} дней. Нажми на название — откроется страница на Shikimori. 👀 — сколько человек с сервера ждут. Отметиться и включить напоминание — в меню под календарём.`
         : 'В ближайшие месяцы премьер с известной датой нет.',
     )
     .setTimestamp(new Date())
@@ -333,7 +354,7 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
   for (const { a, d } of upcoming) {
     const m = `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
     const dd = shortDate(d);
-    const line = `\`${dd}\` [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind}\n`;
+    const line = `\`${dd}\` [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind}${watchBadge('shiki', a.id)}\n`;
     // Discord: до 10 embed'ов и ~6000 символов на сообщение, описание до 4096
     if (total + line.length > 4300) {
       skipped++;
@@ -360,7 +381,7 @@ function calendarEmbeds(list: (ShikiAnime & { base: string })[], cfg: AnimeConfi
   if (recent.length) {
     const lines = recent.map(({ a, d }) => {
       const when = d ? `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCFullYear()}` : 'дата не объявлена';
-      return `• [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind} — ${when}`;
+      return `• [${truncate(titleOf(a), 60).replace(/[[\]]/g, '')}](${linkOf(a)}) · ${KIND_RU[a.kind ?? ''] ?? a.kind} — ${when}${watchBadge('shiki', a.id)}`;
     });
     embeds.push(
       new EmbedBuilder()
@@ -385,3 +406,58 @@ export function runAnimeNow(client: Client) {
   return run(client);
 }
 
+
+
+// ───────────────────────── «Буду смотреть» и напоминания ─────────────────────────
+
+const cleanBb = (t?: string | null) =>
+  (t ?? '')
+    .replace(/\[\[([^\]]+)\]\]/g, '$1')
+    .replace(/\[(\w+)(=[^\]]*)?\]([^[]*)\[\/\1\]/g, '$3')
+    .replace(/\[[^\]]+\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const WEEKDAYS_ACC = ['по воскресеньям', 'по понедельникам', 'по вторникам', 'по средам', 'по четвергам', 'по пятницам', 'по субботам'];
+
+/** Данные о премьере для мини-карточки и напоминания */
+export async function animeInfo(id: number): Promise<PremiereInfo | null> {
+  const cfg = loadCfg();
+  const { base, data: a } = await shikiGet(cfg, `/api/animes/${Math.floor(id)}`);
+  if (!a?.id) return null;
+  const shots = await shikiGet(cfg, `/api/animes/${Math.floor(id)}/screenshots`).catch(() => ({ data: [] as any[] }));
+  const abs = (p?: string) => (p && !p.includes('missing') ? (p.startsWith('http') ? p : `${base}${p}`) : undefined);
+  const poster = abs(a.image?.original);
+  const shot = abs(Array.isArray(shots.data) ? shots.data[0]?.original : undefined);
+  const d = dateRu(a.aired_on);
+  const airAt = a.next_episode_at ? Math.floor(new Date(a.next_episode_at).getTime() / 1000) : undefined;
+  const kind = KIND_RU[a.kind ?? ''] ?? a.kind ?? 'Аниме';
+  const fields: PremiereInfo['fields'] = [];
+  const format = [kind, a.episodes ? `${a.episodes} сер.` : ''].filter(Boolean).join(' · ');
+  fields.push({
+    name: 'Формат',
+    value: `${format}${airAt && a.kind === 'tv' ? `\n${WEEKDAYS_ACC[new Date(airAt * 1000).getUTCDay()]}` : ''}`,
+    inline: true,
+  });
+  const genres = (a.genres ?? []).map((g: any) => g.russian || g.name).filter(Boolean).slice(0, 3).join(', ');
+  if (genres) fields.push({ name: 'Жанры', value: genres, inline: true });
+  const studio = (a.studios ?? []).map((x: any) => x.name).filter(Boolean).slice(0, 2).join(', ');
+  if (studio) fields.push({ name: 'Студия', value: studio, inline: true });
+  return {
+    source: 'shiki',
+    id: String(a.id),
+    title: titleOf(a),
+    original: a.russian && a.name !== a.russian ? a.name : undefined,
+    date: d ? a.aired_on : null,
+    approx: !!d && d.getUTCDate() === 1,
+    released: a.status === 'ongoing' || a.status === 'released',
+    airAt,
+    description: cleanBb(a.description) ? truncate(cleanBb(a.description), 350) : undefined,
+    image: shot ?? poster,
+    thumb: poster,
+    color: 0xeb459e,
+    kindLabel: `Аниме · ${kind}`,
+    fields,
+    link: { label: 'Shikimori', url: `${base}/animes/${a.id}` },
+  };
+}

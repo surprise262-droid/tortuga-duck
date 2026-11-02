@@ -8,8 +8,9 @@ import {
   type Client,
 } from 'discord.js';
 import { db, getSetting, setSetting } from '../db';
-import { trailerButtonRow, trailerMenus } from '../trailerUi';
-import { calendarUrl, cardComponents, upsertPinned } from '../calendarMsg';
+import { cardButtons, pickMenus, trailerButtonRow } from '../trailerUi';
+import { registerCalendar, registerInfo, watchBadge, type PremiereInfo } from '../premiere';
+import { calendarUrl, upsertPinned } from '../calendarMsg';
 import { readConfigJson, truncate } from '../util';
 
 /**
@@ -81,7 +82,20 @@ export const commands = [
 
 let running = false;
 
+/** Последние списки — чтобы перерисовать календарь после отметки «Буду смотреть» без запросов к API */
+let lastData: { movies: Entry[]; series: Entry[] } | null = null;
+
 export function setup(client: Client) {
+  registerInfo('tmdbm', (id) => tmdbInfo('movie', Number(id)));
+  registerInfo('tmdbt', (id, season) => tmdbInfo('tv', Number(id), season ?? undefined));
+  const rerender = async () => {
+    const channelId = getSetting('channel.movies_announce');
+    if (!channelId || !lastData) return;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel?.isTextBased()) await updateCalendar(channel as any, lastData.movies, lastData.series, loadCfg());
+  };
+  registerCalendar('tmdbm', rerender);
+  registerCalendar('tmdbt', rerender);
   client.once(Events.ClientReady, () => void run(client));
   setInterval(() => void run(client), Math.max(60, loadCfg().intervalMinutes) * 60_000);
 }
@@ -346,7 +360,7 @@ async function run(client: Client): Promise<string> {
           const trailer = await trailerFor(x.kind, x.id);
           await channel.send({
             embeds: [announceEmbed(x)],
-            components: cardComponents(trailer ? trailerButtonRow(x.kind === 'movie' ? 'tmdbm' : 'tmdbt', x.id) : null, calendarUrl(channel, 'movies.calendar_msg')),
+            components: cardButtons(x.kind === 'movie' ? 'tmdbm' : 'tmdbt', x.id, !!trailer, calendarUrl(channel, 'movies.calendar_msg')),
           });
           posted++;
         } catch (e) {
@@ -358,6 +372,7 @@ async function run(client: Client): Promise<string> {
     }
 
     await migrateOldCards(channel).catch((e) => console.warn('[movies] Перестройка старых карточек:', (e as Error).message));
+    lastData = { movies, series };
     const calStatus = await updateCalendar(channel, movies, series, cfg);
     if (posted) console.log(`[movies] Новых премьер: ${posted}`);
     return `✅ TMDB: фильмов ${movies.length}, сериалов ${series.length}. Новых карточек: ${posted}. ${calStatus}`;
@@ -414,7 +429,7 @@ function listText(items: Entry[], empty: string): string {
   if (!items.length) return empty;
   const lines = [...items]
     .sort((a, b) => a.date.getTime() - b.date.getTime())
-    .map((x) => `\`${dd(x.date)}\` [${truncate(x.title, 55).replace(/[[\]]/g, '')}](${x.link})${x.note ? ` · ${x.note}` : ''}`);
+    .map((x) => `\`${dd(x.date)}\` [${truncate(x.title, 55).replace(/[[\]]/g, '')}](${x.link})${x.note ? ` · ${x.note}` : ''}${watchBadge(x.kind === 'movie' ? 'tmdbm' : 'tmdbt', x.id)}`);
   let text = '';
   for (const l of lines) {
     // Два списка в одном сообщении, а лимит Discord — 6000 символов на всё: каждому не больше ~2300
@@ -435,7 +450,7 @@ function calendarEmbeds(movies: Entry[], series: Entry[], cfg: MoviesConfig) {
       .setTitle('📺 Сериалы на ближайшее время')
       .setDescription(listText(series, 'Громких премьер сериалов и новых сезонов в ближайшие недели нет.'))
       .setTimestamp(new Date())
-      .setFooter({ text: `Мировые даты премьер на ${cfg.days} дней • обновляется автоматически • ${ATTRIBUTION}` }),
+      .setFooter({ text: `👀 — сколько человек с сервера ждут • мировые даты премьер на ${cfg.days} дней • ${ATTRIBUTION}` }),
   ];
 }
 
@@ -443,15 +458,15 @@ function calendarEmbeds(movies: Entry[], series: Entry[], cfg: MoviesConfig) {
 function calendarComponents(movies: Entry[], series: Entry[]) {
   const byDate = (arr: Entry[]) => [...arr].sort((a, b) => a.date.getTime() - b.date.getTime());
   return [
-    ...trailerMenus(
+    ...pickMenus(
       byDate(movies).map((x) => ({ source: 'tmdbm' as const, id: x.id, title: x.title, hint: `🎬 ${dd(x.date)}` })),
-      '▶️ Трейлер к фильму…',
+      '🎯 Выбрать фильм: трейлер, «буду смотреть», напомнить…',
       'mov',
       1,
     ),
-    ...trailerMenus(
+    ...pickMenus(
       byDate(series).map((x) => ({ source: 'tmdbt' as const, id: x.id, title: x.title, hint: `📺 ${dd(x.date)} · ${x.note ?? ''}` })),
-      '▶️ Трейлер к сериалу…',
+      '🎯 Выбрать сериал: трейлер, «буду смотреть», напомнить…',
       'tv',
       1,
     ),
@@ -462,4 +477,66 @@ async function updateCalendar(channel: any, movies: Entry[], series: Entry[], cf
   const embeds = calendarEmbeds(movies, series, cfg);
   const components = calendarComponents(movies, series);
   return upsertPinned(channel, 'movies.calendar_msg', { embeds, components }, 'movies');
+}
+
+
+// ───────────────────────── «Буду смотреть» и напоминания ─────────────────────────
+
+/** Данные о премьере фильма или сезона сериала для мини-карточки и напоминания */
+export async function tmdbInfo(kind: 'movie' | 'tv', id: number, season?: number): Promise<PremiereInfo | null> {
+  if (keyMissing()) return null;
+  const cfg = loadCfg();
+  const d = await tmdb(`/${kind}/${id}`, { language: cfg.language }).catch(() => null);
+  if (!d?.id) return null;
+  let title: string = (kind === 'movie' ? d.title || d.original_title : d.name || d.original_name) ?? '';
+  const original: string | undefined = kind === 'movie' ? d.original_title : d.original_name;
+  if (title && !readable(title)) {
+    const en = await tmdb(`/${kind}/${id}`, { language: 'en-US' }).catch(() => null);
+    title = (kind === 'movie' ? en?.title : en?.name) || title;
+  }
+  const big = (p?: string | null) => (p ? `https://image.tmdb.org/t/p/w780${p}` : undefined);
+  const today = new Date().toISOString().slice(0, 10);
+  const fields: PremiereInfo['fields'] = [];
+  const genres = (d.genres ?? []).map((g: any) => g.name).slice(0, 3).join(', ');
+  let date: string | null = null;
+  let overview: string | undefined = d.overview || undefined;
+  let kindLabel = 'Фильм';
+  let seasonNo: number | undefined;
+  let poster = posterUrl(d.poster_path);
+
+  if (kind === 'movie') {
+    date = d.release_date || null;
+    if (d.runtime) fields.push({ name: 'Длительность', value: `${Math.floor(d.runtime / 60)} ч ${d.runtime % 60} мин`, inline: true });
+  } else {
+    const next = d.next_episode_to_air;
+    seasonNo = next?.episode_number === 1 ? next.season_number : (season ?? next?.season_number ?? d.last_episode_to_air?.season_number);
+    const s = (d.seasons ?? []).find((x: any) => x.season_number === seasonNo);
+    date = next?.episode_number === 1 && next.season_number === seasonNo ? next.air_date : (s?.air_date ?? null);
+    if (next?.episode_number === 1 && next.overview) overview = next.overview;
+    if (s?.poster_path) poster = posterUrl(s.poster_path);
+    const network = d.networks?.[0]?.name;
+    kindLabel = seasonNo === 1 ? 'Новый сериал' : `Сериал · ${seasonNo ?? '?'} сезон`;
+    fields.push({
+      name: 'Сезон',
+      value: [seasonNo === 1 ? 'новый сериал' : `${seasonNo ?? '?'} сезон`, s?.episode_count ? `${s.episode_count} сер.` : '', network ?? ''].filter(Boolean).join(' · '),
+      inline: true,
+    });
+  }
+  if (genres) fields.push({ name: 'Жанры', value: genres, inline: true });
+  return {
+    source: kind === 'movie' ? 'tmdbm' : 'tmdbt',
+    id: String(d.id),
+    title,
+    original: original && original !== title ? original : undefined,
+    date,
+    released: !!date && date <= today,
+    season: seasonNo,
+    description: overview ? truncate(overview, 350) : undefined,
+    image: big(d.backdrop_path) ?? poster,
+    thumb: poster,
+    color: kind === 'movie' ? COLOR_MOVIE : COLOR_TV,
+    kindLabel,
+    fields,
+    link: { label: 'TMDB', url: `https://themoviedb.org/${kind}/${d.id}` },
+  };
 }
