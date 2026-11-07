@@ -530,13 +530,18 @@ function withAlternatives(main: Track, others: Track[]): Track {
 
 // Слова, по которым узнаются каверы, ремиксы и прочие «не оригиналы»
 const JUNK_WORDS = /(cover|remix|flip|mash ?-?up|slowed|reverb|sped ?up|speed ?up|nightcore|karaoke|instrumental|\blive\b|\bedit\b|\b8d\b|bass ?boost|lo-?fi|acoustic|piano|tribute|8-?bit|кавер|ремикс|караоке|минус|медлен|ускор)/gi;
-const norm = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+/**
+ * Приводим «модные» буквы к обычным: 𝙨𝙡𝙤𝙬𝙚𝙙, ｓｌｏｗｅｄ, 𝓈𝓁𝑜𝓌𝑒𝒹 → slowed (NFKC).
+ * Иначе загрузки с такими названиями обходят все фильтры.
+ */
+const plainLetters = (x: string) => x.normalize('NFKC');
+const norm = (x: string) => plainLetters(x).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
 /** Версии с изменённой скоростью/звуком: их не берём вообще, если человек сам их не искал */
 const ALTERED = /(slowed|sped ?up|speed ?up|nightcore|reverb|\b8d\b|bass ?boost|daycore|медлен|ускор|замедл)/i;
 
 function isAltered(t: Track, wanted: string): boolean {
-  const m = (t.info.title ?? '').match(ALTERED);
+  const m = plainLetters(t.info.title ?? '').match(ALTERED);
   return !!m && !norm(wanted).includes(norm(m[0]));
 }
 
@@ -546,7 +551,7 @@ function isAltered(t: Track, wanted: string): boolean {
  */
 function originalScore(t: Track, artist: string, title: string, durationMs?: number): number {
   const wanted = norm(`${artist} ${title}`);
-  const tTitle = t.info.title ?? '';
+  const tTitle = plainLetters(t.info.title ?? '');
   const nt = norm(tTitle);
   const na = norm(artist);
   const nTitle = norm(title);
