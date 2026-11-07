@@ -102,7 +102,9 @@ async function buildWelcome(member: GuildMember) {
     phrases: ['{user} заходит в бар. Утка за стойкой уже наливает 🍺'],
   });
   const phrase = (pickRandom(cfg.phrases) ?? '').replaceAll('{user}', `<@${member.id}>`).replaceAll('{name}', member.displayName);
-  const accent = (await member.user.fetch(true).catch(() => member.user)).accentColor;
+  // Полный профиль (баннер, цвет, значки) запрашиваем один раз — и для текста, и для карточки
+  const user: any = await member.user.fetch(true).catch(() => member.user);
+  const accent = user.accentColor;
   const embed = baseEmbed()
     .setDescription(phrase)
     .setFooter({ text: `Посетитель №${member.guild.memberCount}` });
@@ -110,7 +112,7 @@ async function buildWelcome(member: GuildMember) {
 
   // Если карточка не нарисовалась — всё равно приветствуем, просто без картинки
   try {
-    const card = await renderCard(member, cfg.title);
+    const card = await renderCard(member, user, cfg.title);
     embed.setImage('attachment://welcome.png');
     return { content: `<@${member.id}>`, embeds: [embed], files: [new AttachmentBuilder(card, { name: 'welcome.png' })] };
   } catch (e) {
@@ -200,12 +202,17 @@ function drawPills(ctx: SKRSContext2D, pills: { text: string; color?: string }[]
   }
 }
 
-async function renderCard(member: GuildMember, title: string): Promise<Buffer> {
+/** Картинка по ссылке с таймаутом — чтобы медленный CDN не подвесил приветствие */
+async function remoteImage(url: string) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return loadImage(Buffer.from(await res.arrayBuffer()));
+}
+
+async function renderCard(member: GuildMember, user: any, title: string): Promise<Buffer> {
   const canvas = createCanvas(W, H);
   const ctx = canvas.getContext('2d');
 
-  // Полный профиль: баннер, цвет профиля, значки
-  const user: any = await member.user.fetch(true).catch(() => member.user);
   const accent: string = user.hexAccentColor ?? '#e8a33d';
 
   // Фон: баннер профиля → картинка из assets/welcome/ → градиент цвета профиля
@@ -215,7 +222,7 @@ async function renderCard(member: GuildMember, title: string): Promise<Buffer> {
   for (const src of [bannerUrl, bgPath]) {
     if (!src || drewBg) continue;
     try {
-      const bg = await loadImage(src.startsWith('http') ? src : fs.readFileSync(src));
+      const bg = src.startsWith('http') ? await remoteImage(src) : await loadImage(fs.readFileSync(src));
       const scale = Math.max(W / bg.width, H / bg.height);
       ctx.drawImage(bg, (W - bg.width * scale) / 2, (H - bg.height * scale) / 2, bg.width * scale, bg.height * scale);
       drewBg = true;
@@ -247,7 +254,7 @@ async function renderCard(member: GuildMember, title: string): Promise<Buffer> {
   const cx = ax + avatarSize / 2;
   const cy = ay + avatarSize / 2;
   try {
-    const avatar = await loadImage(member.displayAvatarURL({ extension: 'png', size: 256 }));
+    const avatar = await remoteImage(member.displayAvatarURL({ extension: 'png', size: 256 }));
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, avatarSize / 2, 0, Math.PI * 2);
@@ -265,7 +272,7 @@ async function renderCard(member: GuildMember, title: string): Promise<Buffer> {
     typeof user.avatarDecorationURL === 'function' ? user.avatarDecorationURL({ size: 256 }) : null;
   if (decoUrl) {
     try {
-      const deco = await loadImage(decoUrl);
+      const deco = await remoteImage(decoUrl);
       const ds = avatarSize * 1.2;
       ctx.drawImage(deco, cx - ds / 2, cy - ds / 2, ds, ds);
       decorated = true;

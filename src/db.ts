@@ -6,6 +6,8 @@ import { config } from './config';
 fs.mkdirSync(config.dataDir, { recursive: true });
 
 export const db = new DatabaseSync(path.join(config.dataDir, 'tortuga.db'));
+// WAL — быстрее и безопаснее при внезапном выключении; busy_timeout — не падать, если база на миг занята
+db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS settings (

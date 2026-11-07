@@ -1,9 +1,17 @@
+# Логи каждого контейнера: не больше 3 файлов по 10 МБ — иначе за месяцы они съедят диск сервера
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # Аудиосервер: декодирует и стримит музыку в голосовой канал
   # (собирается из lavalink/Dockerfile: Lavalink 4 + плагин Soundy для SoundCloud)
   lavalink:
     build: ./lavalink
     restart: unless-stopped
+    logging: *logging
     environment:
       - _JAVA_OPTIONS=-Xmx768m
       - LAVALINK_SERVER_PASSWORD=${LAVALINK_PASSWORD}
@@ -19,6 +27,7 @@ services:
   spotify-tokener:
     image: ghcr.io/topi314/spotify-tokener:master
     restart: unless-stopped
+    logging: *logging
     environment:
       - SPOTIFY_TOKENER_ADDR=0.0.0.0:8080
       - SPOTIFY_TOKENER_LOG_LEVEL=INFO
@@ -29,6 +38,9 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    logging: *logging
+    init: true              # корректно передаёт сигнал остановки и убирает «зомби»-процессы
+    stop_grace_period: 15s
     env_file: .env
     environment:
       - LAVALINK_HOST=lavalink
@@ -46,6 +58,7 @@ services:
   rsshub:
     image: diygod/rsshub:latest
     restart: unless-stopped
+    logging: *logging
     environment:
       - CACHE_EXPIRE=300
     expose:

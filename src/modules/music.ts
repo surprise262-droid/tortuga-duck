@@ -19,7 +19,8 @@ import { LavalinkManager, type Player, type Track } from 'lavalink-client';
 import { config } from '../config';
 import { db, getSetting, setSetting } from '../db';
 import type { ComponentInteraction } from '../types';
-import { baseEmbed, formatDuration, isManager, respond, truncate } from '../util';
+import { baseEmbed, formatDuration, isManager, plain, respond, safeUrl, truncate } from '../util';
+import { checkPublicUrl } from '../net';
 
 export const componentPrefix = 'music';
 
@@ -324,7 +325,7 @@ async function loadTracks(identifier: string, requester: unknown): Promise<LoadR
   const url = `http://${host}:${port}/v4/loadtracks?identifier=${encodeURIComponent(identifier)}`;
   let body: any;
   try {
-    const res = await fetch(url, { headers: { Authorization: password } });
+    const res = await fetch(url, { headers: { Authorization: password }, signal: AbortSignal.timeout(20_000) });
     if (!res.ok) return { kind: 'error', tracks: [], error: `Lavalink ответил HTTP ${res.status}` };
     body = await res.json();
   } catch (e) {
@@ -629,7 +630,7 @@ async function onTrackFailed(client: Client, player: Player, track: any) {
   }
   const requester = track?.requester?.id;
   if (requester && requester !== RADIO_REQUESTER.id) {
-    void notify(client, player, `⚠️ **${truncate(track?.info?.title ?? 'Трек', 80)}** не воспроизводится на SoundCloud — пропускаю.`);
+    void notify(client, player, `⚠️ **${plain(truncate(track?.info?.title ?? 'Трек', 80))}** не воспроизводится на SoundCloud — пропускаю.`);
   }
 }
 
@@ -715,16 +716,16 @@ async function enqueue(
   if (spotify && res.kind === 'playlist') {
     lazyItems = res.tracks.map((t) => toLazy(t, i.user));
     added = [];
-    label = `📃 Плейлист Spotify **${truncate(res.playlistName ?? 'плейлист', 80)}** — ${lazyItems.length} треков. Ищу их на SoundCloud по ходу воспроизведения.`;
+    label = `📃 Плейлист Spotify **${plain(truncate(res.playlistName ?? 'плейлист', 80))}** — ${lazyItems.length} треков. Ищу их на SoundCloud по ходу воспроизведения.`;
   } else if (spotify) {
     const sp = res.tracks[0];
     const found = await findOnSoundCloud(sp.info.author ?? '', sp.info.title ?? '', i.user, sp.info.duration ?? undefined);
-    if (!found) return i.editReply(`🔍 Трек **${truncate(`${sp.info.author} — ${sp.info.title}`, 90)}** есть в Spotify, но на SoundCloud его не нашлось.`);
+    if (!found) return i.editReply(`🔍 Трек **${plain(truncate(`${sp.info.author} — ${sp.info.title}`, 90))}** есть в Spotify, но на SoundCloud его не нашлось.`);
     added = [found];
-    label = `➕ В очереди: **${truncate(found.info.title, 80)}** (${formatDuration(found.info.duration)}) — найдено по ссылке Spotify`;
+    label = `➕ В очереди: **${plain(truncate(found.info.title, 80))}** (${formatDuration(found.info.duration)}) — найдено по ссылке Spotify`;
   } else if (res.kind === 'playlist') {
     added = res.tracks;
-    label = `📃 Добавлен плейлист **${truncate(res.playlistName ?? 'плейлист', 80)}** — ${added.length} треков`;
+    label = `📃 Добавлен плейлист **${plain(truncate(res.playlistName ?? 'плейлист', 80))}** — ${added.length} треков`;
   } else {
     // В поиске пропускаем 30-секундные превью, если есть полноценная версия
     const full =
@@ -736,7 +737,7 @@ async function enqueue(
     }
     if (fileName) (full.info as any).title = fileName;
     added = [full];
-    label = `➕ В очереди: **${truncate(full.info.title, 80)}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
+    label = `➕ В очереди: **${plain(truncate(full.info.title, 80))}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
   }
 
   if (!player) {
@@ -773,7 +774,12 @@ async function enqueue(
 
 async function play(i: ChatInputCommandInteraction<'cached'>) {
   const text = i.options.getString('query', true).trim();
-  if (/^https?:\/\//i.test(text)) return enqueue(i, () => loadTracks(text, i.user));
+  if (/^https?:\/\//i.test(text)) {
+    // Lavalink откроет ссылку сам — не пускаем его во внутреннюю сеть сервера
+    const bad = await checkPublicUrl(text);
+    if (bad) return respond(i, `❌ Эту ссылку открыть нельзя: ${bad}.`);
+    return enqueue(i, () => loadTracks(text, i.user));
+  }
 
   // Выбран вариант из подсказок — играем именно его оригинал
   const dz = text.match(/^dz:(\d+)$/)?.[1];
@@ -1232,7 +1238,7 @@ function stationPanel(player: Player) {
       [
         [`${st.flag} ${st.country}`.trim(), st.genreLabel, st.bitrate ? `${st.bitrate} kbps` : '', st.codec].filter(Boolean).join(' · '),
         '',
-        now ? `🎵 Сейчас в эфире: **${truncate(now, 200)}**` : '🎵 Станция не передаёт название трека',
+        now ? `🎵 Сейчас в эфире: **${plain(truncate(now, 200))}**` : '🎵 Станция не передаёт название трека',
         `⏱ В эфире: ${onAir}`,
       ].join('\n'),
     )
@@ -1240,8 +1246,10 @@ function stationPanel(player: Player) {
     .setFooter({ text: `${fav ? '⭐ В избранном сервера • ' : ''}Каталог радиостанций Radio Browser` });
   if (fx && fx !== 'off' && FX[fx]) embed.addFields({ name: 'Эффект', value: `${FX[fx][1]} ${FX[fx][0]}`, inline: true });
   if (requester) embed.addFields({ name: 'Включил', value: `<@${requester}>`, inline: true });
-  if (st.homepage?.startsWith('http')) embed.setURL(st.homepage);
-  if (st.favicon?.startsWith('https://')) embed.setThumbnail(st.favicon);
+  const home = safeUrl(st.homepage);
+  if (home) embed.setURL(home);
+  const icon = safeUrl(st.favicon);
+  if (icon?.startsWith('https://')) embed.setThumbnail(icon);
 
   const sbtn = (id: string, emoji: string, label: string, style = ButtonStyle.Secondary) =>
     new ButtonBuilder().setCustomId(`station:${id}`).setEmoji(emoji).setLabel(label).setStyle(style);
@@ -1272,21 +1280,23 @@ function panelPayload(player: Player) {
   const requester = (track.requester as any)?.id;
   const next = player.queue.tracks
     .slice(0, 3)
-    .map((t: any, idx: number) => `\`${idx + 1}.\` ${truncate(t.info.title, 50)}`)
+    .map((t: any, idx: number) => `\`${idx + 1}.\` ${plain(truncate(t.info.title, 50))}`)
     .join('\n');
 
   const embed = baseEmbed()
     .setAuthor({ name: player.paused ? '⏸ На паузе' : '🎶 Сейчас играет' })
     .setTitle(truncate(info.title, 250))
-    .setDescription(`${info.author ? `**${truncate(info.author, 100)}**\n` : ''}${progressBar(player.position, info.isStream ? 0 : info.duration)}`)
+    .setDescription(`${info.author ? `**${plain(truncate(info.author, 100))}**\n` : ''}${progressBar(player.position, info.isStream ? 0 : info.duration)}`)
     .addFields(
       { name: 'Громкость', value: `${player.volume}%`, inline: true },
       { name: 'Порядок', value: player.get('shuffle') ? '🔀 Перемешано' : '➡️ По порядку', inline: true },
       { name: 'Повтор', value: repeatLabel(player.repeatMode), inline: true },
     )
     .setFooter({ text: `В очереди: ${player.queue.tracks.length} • DJ-режим: ${djModeOn() ? 'вкл' : 'выкл'}` });
-  if (info.uri?.startsWith('http')) embed.setURL(info.uri);
-  if (info.artworkUrl) embed.setThumbnail(info.artworkUrl);
+  const uri = safeUrl(info.uri);
+  if (uri) embed.setURL(uri);
+  const art = safeUrl(info.artworkUrl);
+  if (art) embed.setThumbnail(art);
   if (requester) {
     embed.addFields({ name: 'Заказал', value: requester === RADIO_REQUESTER.id ? '📻 Радио' : `<@${requester}>`, inline: true });
   }
@@ -1323,7 +1333,7 @@ function queueEmbed(player: Player | undefined) {
   if (!player?.queue.current) return baseEmbed().setDescription('🎵 Очередь пуста.');
   const lines = player.queue.tracks
     .slice(0, 15)
-    .map((t: any, idx: number) => `\`${idx + 1}.\` ${truncate(t.info.title, 60)} — ${t.info.isStream ? 'эфир' : formatDuration(t.info.duration)}`);
+    .map((t: any, idx: number) => `\`${idx + 1}.\` ${plain(truncate(t.info.title, 60))} — ${t.info.isStream ? 'эфир' : formatDuration(t.info.duration)}`);
   const more = player.queue.tracks.length > 15 ? `\n…и ещё ${player.queue.tracks.length - 15}` : '';
   const lazy = lazyOf(player);
   const pending: RadioItem[] = player.get('radio') ? player.get('radioPending') ?? [] : [];
@@ -1334,7 +1344,7 @@ function queueEmbed(player: Player | undefined) {
   return baseEmbed()
     .setTitle('📜 Очередь')
     .setDescription(
-      `**Сейчас:** ${truncate(player.queue.current.info.title, 80)}\n\n${lines.join('\n') || 'Дальше пусто.'}${more}${extra ? `\n\n${extra}` : ''}`,
+      `**Сейчас:** ${plain(truncate(player.queue.current.info.title, 80))}\n\n${lines.join('\n') || 'Дальше пусто.'}${more}${extra ? `\n\n${extra}` : ''}`,
     );
 }
 
@@ -1402,7 +1412,8 @@ function showPanel(client: Client, player: Player, playing: boolean, channelOver
     }
 
     stopProgress(guildId);
-    if (playing) progressTimers.set(guildId, setInterval(() => void refreshPanel(player), 15_000));
+    // В эфире полосы прогресса нет — панель раз в минуту обновляет модуль радиостанций
+    if (playing && !player.get('station')) progressTimers.set(guildId, setInterval(() => void refreshPanel(player), 15_000));
   });
 }
 
@@ -1446,7 +1457,7 @@ async function offerDeezer(player: Player, label: string) {
   );
   const m = await channel
     .send({
-      content: `📻 Spotify не смог подобрать похожие для **${truncate(label, 80)}**. Радио попробует снова на следующем треке.`,
+      content: `📻 Spotify не смог подобрать похожие для **${plain(truncate(label, 80))}**. Радио попробует снова на следующем треке.`,
       components: [row],
     })
     .catch(() => null);

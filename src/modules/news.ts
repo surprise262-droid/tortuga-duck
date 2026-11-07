@@ -10,7 +10,7 @@ import {
 } from 'discord.js';
 import { config } from '../config';
 import { db, getSetting } from '../db';
-import { hexToInt, readConfigJson, truncate } from '../util';
+import { hexToInt, readConfigJson, safeUrl, truncate } from '../util';
 
 interface FeedSource {
   name: string;
@@ -83,8 +83,11 @@ export function runNewsNow(client: Client) {
 }
 
 export function setup(client: Client) {
-  client.once(Events.ClientReady, () => void runAll(client));
-  setInterval(() => void runAll(client), config.newsIntervalMinutes * 60_000);
+  client.once(Events.ClientReady, () => {
+    seen.cleanup();
+    void runAll(client);
+  });
+  setInterval(() => void runAll(client), Math.max(5, config.newsIntervalMinutes) * 60_000);
   setInterval(() => seen.cleanup(), 24 * 60 * 60_000);
 }
 
@@ -206,6 +209,13 @@ async function runCategory(
     } catch (e) {
       const msg = (e as Error).message;
       console.warn(`[news] Не удалось отправить «${item.title}»:`, msg);
+      // Новость, которая не отправляется 3 раза подряд, пропускаем — иначе она навсегда займёт очередь
+      const tries = (failures.get(item.guid) ?? 0) + 1;
+      failures.set(item.guid, tries);
+      if (tries >= 3) {
+        seen.add(feedKey, item.guid);
+        failures.delete(item.guid);
+      }
       report?.push(`  • ❌ не отправилось «${truncate(item.title, 60)}»: ${truncate(msg, 100)}`);
     }
   }
@@ -215,16 +225,21 @@ async function runCategory(
   return posted;
 }
 
+/** Сколько раз подряд не удалось отправить новость (guid → попытки) */
+const failures = new Map<string, number>();
+
 function toEmbed(item: NewsItem, cat: Category) {
   const e = new EmbedBuilder()
     .setColor(hexToInt(cat.color))
     .setAuthor({ name: `${cat.title} • ${item.source}` })
     .setTitle(truncate(item.title, 250))
     .setTimestamp(new Date(item.date));
-  if (item.link) e.setURL(item.link);
+  const link = safeUrl(item.link);
+  if (link) e.setURL(link);
   if (item.text) e.setDescription(truncate(item.text, 350));
-  if (item.image?.startsWith('http')) e.setImage(item.image);
-  if (item.fields?.length) e.addFields(item.fields);
+  const image = safeUrl(item.image);
+  if (image) e.setImage(image);
+  if (item.fields?.length) e.addFields(item.fields.slice(0, 25));
   return e;
 }
 
@@ -344,7 +359,7 @@ async function fetchRss(src: FeedSource): Promise<NewsItem[]> {
     const isTelegram = /^https?:\/\/t\.me\//i.test(it.link ?? '');
     return {
       guid: String(it.guid ?? it.link ?? it.title),
-      title: it.title ?? 'Без заголовка',
+      title: String(it.title ?? '').trim() || 'Без заголовка',
       link: it.link,
       // У Telegram-постов убираем цитату, на которую отвечает пост
       text: (isTelegram ? cleanTelegramText(htmlToText(withoutQuotes(html))) : undefined) ?? it.contentSnippet ?? it.summary,
@@ -356,7 +371,7 @@ async function fetchRss(src: FeedSource): Promise<NewsItem[]> {
 }
 
 async function fetchGamerPower(src: FeedSource): Promise<NewsItem[]> {
-  const res = await fetch(src.url, { headers: { 'User-Agent': 'TortugaDuckBot/1.0' } });
+  const res = await fetch(src.url, { headers: { 'User-Agent': 'TortugaDuckBot/1.0' }, signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as any[];
   if (!Array.isArray(data)) return [];

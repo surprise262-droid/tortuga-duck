@@ -12,7 +12,8 @@ import {
 import type { Player } from 'lavalink-client';
 import { db } from '../db';
 import type { ComponentInteraction } from '../types';
-import { baseEmbed, respond, truncate } from '../util';
+import { baseEmbed, plain, respond, truncate } from '../util';
+import { safeFetch } from '../net';
 import { musicApi, type StationMeta } from './music';
 
 /**
@@ -143,8 +144,13 @@ function isDead(uuid: string) {
   return true;
 }
 
-/** Все станции, что бот видел, — чтобы не спрашивать каталог повторно */
+/** Станции, что бот видел недавно, — чтобы не спрашивать каталог повторно (не больше 2000, старые вытесняются) */
 const known = new Map<string, RbStation>();
+function remember(s: RbStation) {
+  known.delete(s.stationuuid);
+  known.set(s.stationuuid, s);
+  if (known.size > 2000) known.delete(known.keys().next().value as string);
+}
 
 function usable(s: RbStation) {
   return (
@@ -172,7 +178,7 @@ function rank(list: RbStation[]): RbStation[] {
     seen.add(k);
     seen.add(s.stationuuid);
     out.push(s);
-    known.set(s.stationuuid, s);
+    remember(s);
   }
   return out.sort((a, b) => Number(isPriority(b)) - Number(isPriority(a)));
 }
@@ -223,7 +229,7 @@ async function stationByUuid(uuid: string): Promise<RbStation | null> {
   try {
     const list = await rb<RbStation[]>(`/json/stations/byuuid/${encodeURIComponent(uuid)}`, 5000);
     if (list[0]) {
-      known.set(uuid, list[0]);
+      remember(list[0]);
       return list[0];
     }
   } catch {
@@ -327,7 +333,8 @@ async function probe(url: string, depth = 0): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 6000);
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': UA, 'Icy-MetaData': '1' }, signal: ctrl.signal, redirect: 'follow' });
+    // safeFetch не пускает в локальную сеть сервера: ссылки станций приходят из открытого каталога
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, 'Icy-MetaData': '1' }, signal: ctrl.signal });
     if (!res.ok) throw new Error(`сервер станции ответил ${res.status}`);
     const type = res.headers.get('content-type') ?? '';
     const finalUrl = res.url || url;
@@ -347,6 +354,7 @@ async function probe(url: string, depth = 0): Promise<string> {
     return finalUrl;
   } catch (e) {
     if ((e as Error).name === 'AbortError') throw new Error('станция не ответила за 6 секунд');
+    if ((e as Error).name === 'TypeError') throw new Error('не удалось подключиться к станции');
     throw e;
   } finally {
     clearTimeout(timer);
@@ -391,17 +399,22 @@ async function readIcyTitle(url: string): Promise<string | null | undefined> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': UA, 'Icy-MetaData': '1' }, signal: ctrl.signal });
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, 'Icy-MetaData': '1' }, signal: ctrl.signal });
     const metaint = Number(res.headers.get('icy-metaint'));
     if (!res.ok || !metaint || metaint > 256_000) return undefined;
     const reader = res.body!.getReader();
+    // Куски складываем в список и склеиваем один раз — поток читается каждые 30 секунд, без лишних копий
+    const chunks: Buffer[] = [];
+    let total = 0;
     let buf = Buffer.alloc(0);
     try {
-      while (buf.length < metaint + 1 + 4080) {
+      while (total < metaint + 1 + 4080) {
         const { value, done } = await reader.read();
         if (done || !value) break;
-        buf = Buffer.concat([buf, Buffer.from(value)]);
-        if (buf.length > metaint) {
+        chunks.push(Buffer.from(value));
+        total += value.length;
+        if (total > metaint) {
+          if (buf.length !== total) buf = Buffer.concat(chunks, total);
           const len = buf[metaint] * 16;
           if (len === 0) return null;
           if (buf.length >= metaint + 1 + len) {
@@ -489,7 +502,7 @@ async function tuneFirstAlive(
   for (const s of candidates.slice(0, 4)) {
     const err = await tune(guildId, voiceChannelId, textChannelId, requester, s, genreKey);
     if (!err) return { station: s, errors };
-    errors.push(`**${truncate(cleanName(s.name), 60)}** — ${err}`);
+    errors.push(`**${plain(truncate(cleanName(s.name), 60))}** — ${err}`);
     if (err.startsWith('🎶')) break;
   }
   return { station: null, errors };
@@ -530,11 +543,11 @@ async function onStreamEnd(player: Player, reason: 'end' | 'error') {
     const candidates = await nextInGenre(meta).catch(() => [] as RbStation[]);
     const { station } = await tuneFirstAlive(player.guildId, player.voiceChannelId, textId, requester, candidates, meta.genreKey);
     if (station) {
-      await musicApi.notify(player, `📻 Станция **${truncate(meta.name, 80)}** пропала из эфира — переключил на **${truncate(cleanName(station.name), 80)}**.`);
+      await musicApi.notify(player, `📻 Станция **${plain(truncate(meta.name, 80))}** пропала из эфира — переключил на **${plain(truncate(cleanName(station.name), 80))}**.`);
     } else {
       player.set('station', null);
       player.set('stationNow', null);
-      await musicApi.notify(player, `📻 Станция **${truncate(meta.name, 80)}** пропала из эфира, а замену найти не удалось. Выбери другую: \`/station\`.`);
+      await musicApi.notify(player, `📻 Станция **${plain(truncate(meta.name, 80))}** пропала из эфира, а замену найти не удалось. Выбери другую: \`/station\`.`);
       await player.stopPlaying(true, false).catch(() => {});
       await musicApi.refreshPanel(player);
     }
@@ -729,14 +742,14 @@ async function playStation(i: ChatInputCommandInteraction | ComponentInteraction
           .setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId('station:cancel').setLabel('Отмена').setStyle(ButtonStyle.Secondary),
       );
-      return reply(`В очереди **${player.queue.tracks.length}** трек(ов). Включить **${truncate(cleanName(s.name), 80)}** вместо них? Очередь будет очищена.`, [row]);
+      return reply(`В очереди **${player.queue.tracks.length}** трек(ов). Включить **${plain(truncate(cleanName(s.name), 80))}** вместо них? Очередь будет очищена.`, [row]);
     }
   }
 
-  await reply(`📡 Проверяю эфир **${truncate(cleanName(s.name), 80)}**…`);
+  await reply(`📡 Проверяю эфир **${plain(truncate(cleanName(s.name), 80))}**…`);
   const requester = { id: member.id, username: member.user.username };
   const first = await tune(i.guildId, voice.id, i.channelId!, requester, s, genreKey);
-  if (!first) return reply(`🔴 В эфире: **${truncate(cleanName(s.name), 80)}**`);
+  if (!first) return reply(`🔴 В эфире: **${plain(truncate(cleanName(s.name), 80))}**`);
   if (first.startsWith('🎶')) return reply(first);
 
   // Станция мёртвая — предлагаем соседнюю того же жанра
@@ -754,7 +767,7 @@ async function playStation(i: ChatInputCommandInteraction | ComponentInteraction
       ]
     : [];
   return reply(
-    `📴 **${truncate(cleanName(s.name), 80)}** не в эфире: ${first}.\nСтанцию спрятал на сутки.${alt.length ? ' Выбери другую того же жанра 👇' : ''}`,
+    `📴 **${plain(truncate(cleanName(s.name), 80))}** не в эфире: ${first}.\nСтанцию спрятал на сутки.${alt.length ? ' Выбери другую того же жанра 👇' : ''}`,
     row,
   );
 }
@@ -806,7 +819,7 @@ export async function onComponent(i: ComponentInteraction) {
     if (!s) return respond(i, '⚠️ Не удалось найти станцию в каталоге.');
     const on = toggleFavorite(s, i.user.id);
     await musicApi.refreshPanel(player);
-    return respond(i, on ? `⭐ **${truncate(meta.name, 80)}** — в избранном сервера.` : `☆ **${truncate(meta.name, 80)}** убрана из избранного.`);
+    return respond(i, on ? `⭐ **${plain(truncate(meta.name, 80))}** — в избранном сервера.` : `☆ **${plain(truncate(meta.name, 80))}** убрана из избранного.`);
   }
 
   if (action === 'next') {
@@ -818,7 +831,7 @@ export async function onComponent(i: ComponentInteraction) {
     const requester = { id: i.user.id, username: i.user.username };
     const { station, errors } = await tuneFirstAlive(i.guildId, player.voiceChannelId!, i.channelId!, requester, candidates, meta.genreKey);
     if (station) {
-      return i.editReply(`🔴 В эфире: **${truncate(cleanName(station.name), 80)}**${errors.length ? `\n-# Пропустил мёртвые: ${errors.length}` : ''}`);
+      return i.editReply(`🔴 В эфире: **${plain(truncate(cleanName(station.name), 80))}**${errors.length ? `\n-# Пропустил мёртвые: ${errors.length}` : ''}`);
     }
     return i.editReply(`📴 Не удалось включить соседние станции:\n${errors.slice(0, 4).join('\n')}`);
   }

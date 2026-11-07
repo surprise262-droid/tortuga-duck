@@ -32,6 +32,9 @@ interface PvcRow {
   empty_since: number | null;
 }
 
+/** Кому прямо сейчас создаётся канал */
+const creating = new Set<string>();
+
 /** channelId → время последних переименований (Discord даёт 2 переименования за 10 минут) */
 const renameLog = new Map<string, number[]>();
 
@@ -72,7 +75,14 @@ async function onJoin(state: VoiceState) {
   if (!member || member.user.bot) return;
 
   if (state.channelId === getSetting('channel.vc_lobby')) {
-    await createFor(member, state);
+    // Двойной заход в лобби подряд не должен создать два канала
+    if (creating.has(member.id)) return;
+    creating.add(member.id);
+    try {
+      await createFor(member, state);
+    } finally {
+      creating.delete(member.id);
+    }
     return;
   }
   if (q.get(state.channelId!)) q.setEmpty(state.channelId!, null);
@@ -117,8 +127,12 @@ async function createFor(member: GuildMember, state: VoiceState) {
     bitrate: lobby.bitrate,
     reason: `Приватный канал для ${member.user.tag}`,
   });
+  // Сразу ставим на учёт: если дальше что-то упадёт, пустой канал всё равно удалится по таймеру
+  q.insert({ channel_id: channel.id, guild_id: guild.id, owner_id: member.id, created_at: Date.now(), empty_since: null });
   // Права категории наследуются автоматически, добавляем права владельцу
-  await channel.permissionOverwrites.edit(member.id, { ViewChannel: true, Connect: true, Speak: true, Stream: true });
+  await channel.permissionOverwrites
+    .edit(member.id, { ViewChannel: true, Connect: true, Speak: true, Stream: true })
+    .catch((e) => console.warn('[pvc] Не удалось выдать права владельцу:', e?.message));
   // И самому боту — чтобы «Скрыть»/«Закрыть» не отрезали ему доступ и он мог удалить пустой канал
   if (guild.members.me) {
     await channel.permissionOverwrites
@@ -126,7 +140,6 @@ async function createFor(member: GuildMember, state: VoiceState) {
       .catch((e) => console.warn('[pvc] Не удалось выдать права боту в канале:', e?.message));
   }
 
-  q.insert({ channel_id: channel.id, guild_id: guild.id, owner_id: member.id, created_at: Date.now(), empty_since: null });
   await member.voice.setChannel(channel).catch(async () => {
     // Пользователь успел выйти — канал станет пустым и удалится по таймеру
     q.setEmpty(channel.id, Date.now());

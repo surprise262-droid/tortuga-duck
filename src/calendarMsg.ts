@@ -60,7 +60,20 @@ export async function cleanupPinNotices(channel: any) {
   }
 }
 
-export async function upsertPinned(channel: any, settingKey: string, payload: { embeds: any[]; components: any[] }, tag: string): Promise<string> {
+/** Одновременно один календарь обновляется только одной операцией — иначе два обновления подряд отправят его дважды */
+const locks = new Map<string, Promise<unknown>>();
+
+export function upsertPinned(channel: any, settingKey: string, payload: { embeds: any[]; components: any[] }, tag: string): Promise<string> {
+  const prev = locks.get(settingKey) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(() => upsertPinnedNow(channel, settingKey, payload, tag));
+  locks.set(settingKey, next);
+  void next.finally(() => {
+    if (locks.get(settingKey) === next) locks.delete(settingKey);
+  }).catch(() => {});
+  return next;
+}
+
+async function upsertPinnedNow(channel: any, settingKey: string, payload: { embeds: any[]; components: any[] }, tag: string): Promise<string> {
   const parts = splitPayload(payload);
   const oldIds = savedIds(settingKey);
 

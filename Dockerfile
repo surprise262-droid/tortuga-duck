@@ -7,10 +7,11 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY tsconfig.json ./
 COPY src ./src
 
 ENV NODE_ENV=production
-CMD ["npx", "tsx", "src/index.ts"]
+# Один процесс Node вместо цепочки npx → tsx → node: меньше памяти, и сигнал остановки доходит сразу до бота
+CMD ["node", "--import", "tsx", "src/index.ts"]

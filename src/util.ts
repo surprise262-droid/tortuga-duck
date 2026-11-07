@@ -61,3 +61,26 @@ export function hexToInt(hex: string | undefined, fallback = config.color): numb
   const n = parseInt(hex.replace('#', ''), 16);
   return Number.isFinite(n) ? n : fallback;
 }
+
+/** Ссылка для embed/кнопки: только корректный http(s)-адрес, иначе undefined (discord.js падает на кривых URL) */
+export function safeUrl(u: string | null | undefined): string | undefined {
+  if (!u) return undefined;
+  try {
+    const url = new URL(u.trim());
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Чужой текст (названия треков и станций, «сейчас в эфире») — без разметки Discord:
+ * не даёт вставить замаскированную ссылку [текст](адрес), упоминания @everyone/@роль/@человек и форматирование.
+ */
+export function plain(text: string | null | undefined): string {
+  return (text ?? '')
+    .replace(/<(@[!&]?|#)(\d+)>/g, '‹$1$2›')
+    .replace(/[\\`*_~|>\[\]()]/g, (c) => `\\${c}`)
+    .replace(/@(everyone|here)/gi, '@​$1')
+    .replace(/https?:\/\//gi, (m) => m.replace('//', '/​/'));
+}
