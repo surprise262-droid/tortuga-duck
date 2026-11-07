@@ -7,7 +7,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 ARG SOUNDY_REPO=https://github.com/lowkwrs/soundy.git
-ARG SOUNDY_REF=main
+# Закреплённая версия (1.1.0 от 20.10.2026): без этого каждая пересборка берёт новейший код и может всё поменять
+ARG SOUNDY_REF=e2c5da8
 WORKDIR /src
 RUN git clone "$SOUNDY_REPO" . && git checkout "$SOUNDY_REF"
 RUN chmod +x gradlew && ./gradlew :plugin:jar --no-daemon -q

@@ -28,13 +28,14 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
   ],
   // Бот никогда не пингует @everyone, @here и роли — даже если такой текст придёт из названия трека, станции или новости
-  allowedMentions: { parse: ['users'], repliedUser: false },
+  allowedMentions: { parse: ['users'] },
   // Сообщения в памяти держим недолго — бот не читает чат, а память на сервере не бесконечная
   sweepers: { messages: { interval: 3600, lifetime: 1800 } },
   rest: {
     // Discord разрешает менять канал (название и т.п.) редко. По умолчанию discord.js в таком случае
     // молча ждёт до 10 минут, и кнопка «зависает». Вместо этого получаем ошибку и объясняем пользователю.
-    rejectOnRateLimit: (data) => data.method === 'PATCH' && data.route.startsWith('/channels'),
+    // Только сам канал (/channels/:id), а не сообщения в нём: правки плеера должны ждать очереди, а не падать
+    rejectOnRateLimit: (data) => data.method === 'PATCH' && /^\/channels\/[^/]+$/.test(data.route),
   },
 });
 

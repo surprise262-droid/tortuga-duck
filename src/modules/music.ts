@@ -360,7 +360,12 @@ async function searchByText(text: string, requester: unknown): Promise<LoadResul
   let last: LoadResult = { kind: 'empty', tracks: [] };
   for (const prefix of ['scsearch', 'bcsearch']) {
     const res = await loadTracks(`${prefix}:${text}`, requester);
-    if (res.tracks.length) return res;
+    if (res.tracks.length) {
+      // Замедленные/ускоренные версии — в конец списка (если их не искали специально)
+      const normal = res.tracks.filter((t) => !isAltered(t, text));
+      const altered = res.tracks.filter((t) => isAltered(t, text));
+      return { ...res, tracks: [...normal, ...altered] };
+    }
     if (res.kind === 'error') console.warn(`[music] ${prefix} «${text}»: ${res.error}`);
     last = res;
   }
@@ -527,6 +532,14 @@ function withAlternatives(main: Track, others: Track[]): Track {
 const JUNK_WORDS = /(cover|remix|flip|mash ?-?up|slowed|reverb|sped ?up|speed ?up|nightcore|karaoke|instrumental|\blive\b|\bedit\b|\b8d\b|bass ?boost|lo-?fi|acoustic|piano|tribute|8-?bit|кавер|ремикс|караоке|минус|медлен|ускор)/gi;
 const norm = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
+/** Версии с изменённой скоростью/звуком: их не берём вообще, если человек сам их не искал */
+const ALTERED = /(slowed|sped ?up|speed ?up|nightcore|reverb|\b8d\b|bass ?boost|daycore|медлен|ускор|замедл)/i;
+
+function isAltered(t: Track, wanted: string): boolean {
+  const m = (t.info.title ?? '').match(ALTERED);
+  return !!m && !norm(wanted).includes(norm(m[0]));
+}
+
 /**
  * Насколько загрузка похожа на оригинал: штраф за «cover/remix/slowed…» (если их не искали),
  * бонус за совпадение автора загрузки с исполнителем, за название и за длительность.
@@ -556,7 +569,9 @@ async function findOnSoundCloud(artist: string, title: string, requester: unknow
   const q = `${artist} ${title}`.trim();
   if (!q) return undefined;
   const res = await loadTracks(`scsearch:${q}`, requester);
-  const ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri));
+  const ok = res.tracks.filter(
+    (t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri) && !isAltered(t, q),
+  );
   if (!ok.length) return undefined;
   const ranked = ok
     .map((t, k) => ({ t, k, s: originalScore(t, artist, title, durationMs) }))
@@ -1398,8 +1413,16 @@ function showPanel(client: Client, player: Player, playing: boolean, channelOver
     }
 
     if (msg) {
-      const ok = await msg.edit(panelPayload(player)).then(() => true).catch(() => false);
-      if (!ok) msg = null;
+      const err = await msg.edit(panelPayload(player)).then(() => null).catch((e) => e);
+      if (err) {
+        // Новое сообщение — только если старого плеера больше нет (удалили или нет доступа).
+        // При лимите Discord или сбое сети просто пропускаем это обновление, иначе получается флуд.
+        if ([10008, 10003, 50001].includes(err?.code)) msg = null;
+        else {
+          console.warn('[music] Не удалось обновить плеер:', err?.message ?? err);
+          return;
+        }
+      }
     }
     if (!msg) {
       msg = await channel.send(panelPayload(player)).catch((e) => {
@@ -1421,10 +1444,14 @@ function refreshPanel(player: Player) {
   return withPanelLock(player.guildId, async () => {
     const msg = panels.get(player.guildId);
     if (!msg) return;
-    await msg.edit(panelPayload(player)).catch(() => {
-      panels.delete(player.guildId);
-      setSetting(panelKey(player.guildId), null);
-      stopProgress(player.guildId);
+    await msg.edit(panelPayload(player)).catch((e) => {
+      // Забываем плеер, только если сообщения больше нет. При лимите Discord просто пропускаем обновление —
+      // иначе следующий трек отправит новое окно плеера, и в канале будет флуд.
+      if ([10008, 10003, 50001].includes(e?.code)) {
+        panels.delete(player.guildId);
+        setSetting(panelKey(player.guildId), null);
+        stopProgress(player.guildId);
+      } else console.warn('[music] Не удалось обновить плеер:', e?.message ?? e);
     });
   });
 }
