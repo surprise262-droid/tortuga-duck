@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createCanvas, GlobalFonts, loadImage, type SKRSContext2D } from '@napi-rs/canvas';
+import { createCanvas, GlobalFonts, loadImage } from '@napi-rs/canvas';
 import {
+  ActivityType,
   AttachmentBuilder,
   Events,
   MessageFlags,
@@ -14,14 +15,13 @@ import {
 import { config } from '../config';
 import { getSetting } from '../db';
 import { baseEmbed, pickRandom, readConfigJson, respond } from '../util';
+import { CARD_H, CARD_W, drawClubCard, normalizeCardColor } from '../welcomeCard';
 
 interface WelcomeConfig {
   title: string;
   phrases: string[];
 }
 
-const W = 1100;
-const H = 420;
 const IMG_EXT = /\.(png|jpe?g|webp|gif)$/i;
 
 // Шрифт с кириллицей (в Docker ставится пакет fonts-dejavu-core)
@@ -105,14 +105,12 @@ async function buildWelcome(member: GuildMember) {
   // Полный профиль (баннер, цвет, значки) запрашиваем один раз — и для текста, и для карточки
   const user: any = await member.user.fetch(true).catch(() => member.user);
   const accent = user.accentColor;
-  const embed = baseEmbed()
-    .setDescription(phrase)
-    .setFooter({ text: `Посетитель №${member.guild.memberCount}` });
+  const embed = baseEmbed().setDescription(phrase);
   if (accent) embed.setColor(accent);
 
   // Если карточка не нарисовалась — всё равно приветствуем, просто без картинки
   try {
-    const card = await renderCard(member, user, cfg.title);
+    const card = await renderCard(member, user);
     embed.setImage('attachment://welcome.png');
     return { content: `<@${member.id}>`, embeds: [embed], files: [new AttachmentBuilder(card, { name: 'welcome.png' })] };
   } catch (e) {
@@ -133,75 +131,6 @@ function listImages(dir: string): string[] {
   }
 }
 
-function roundRect(ctx: SKRSContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
-function fitText(ctx: SKRSContext2D, text: string, maxWidth: number, startSize: number, minSize = 20) {
-  let size = startSize;
-  do {
-    ctx.font = `${size}px ${FONT}`;
-    if (ctx.measureText(text).width <= maxWidth) break;
-    size -= 2;
-  } while (size > minSize);
-  return size;
-}
-
-/** Значки профиля Discord (публичные флаги) → подпись и цвет плашки */
-const BADGES: Record<string, [string, string]> = {
-  Staff: ['Сотрудник Discord', '#5865F2'],
-  Partner: ['Партнёр Discord', '#5865F2'],
-  Hypesquad: ['HypeSquad Events', '#F47B67'],
-  BugHunterLevel1: ['Охотник за багами', '#3BA55C'],
-  BugHunterLevel2: ['Охотник за багами II', '#F1C40F'],
-  HypeSquadOnlineHouse1: ['HypeSquad Bravery', '#9C84EF'],
-  HypeSquadOnlineHouse2: ['HypeSquad Brilliance', '#F47B67'],
-  HypeSquadOnlineHouse3: ['HypeSquad Balance', '#45DDC0'],
-  PremiumEarlySupporter: ['Ранний сторонник', '#EB459E'],
-  VerifiedDeveloper: ['Разработчик ботов', '#5865F2'],
-  CertifiedModerator: ['Модератор Discord', '#5865F2'],
-  ActiveDeveloper: ['Активный разработчик', '#23A55A'],
-};
-
-function hexToRgb(hex: string) {
-  const n = parseInt(hex.replace('#', ''), 16);
-  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
-}
-
-/** Рисует «пилюли» (плашки с текстом) в строку, переносит на следующую строку при нехватке места */
-function drawPills(ctx: SKRSContext2D, pills: { text: string; color?: string }[], x: number, y: number, maxW: number) {
-  ctx.font = `22px ${FONT}`;
-  const h = 36;
-  let cx = x;
-  let cy = y;
-  for (const p of pills) {
-    const dot = p.color ? 18 : 0;
-    const w = ctx.measureText(p.text).width + 28 + dot;
-    if (cx + w > x + maxW && cx > x) {
-      cx = x;
-      cy += h + 10;
-    }
-    ctx.fillStyle = 'rgba(255,255,255,0.12)';
-    roundRect(ctx, cx, cy, w, h, h / 2);
-    ctx.fill();
-    if (p.color) {
-      ctx.fillStyle = p.color;
-      ctx.beginPath();
-      ctx.arc(cx + 18, cy + h / 2, 6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.fillText(p.text, cx + 14 + dot, cy + 25);
-    cx += w + 10;
-  }
-}
-
 /** Картинка по ссылке с таймаутом — чтобы медленный CDN не подвесил приветствие */
 async function remoteImage(url: string) {
   const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -209,124 +138,85 @@ async function remoteImage(url: string) {
   return loadImage(Buffer.from(await res.arrayBuffer()));
 }
 
-async function renderCard(member: GuildMember, user: any, title: string): Promise<Buffer> {
-  const canvas = createCanvas(W, H);
+/** Средний цвет аватарки — если у человека не задан цвет профиля */
+function averageColor(img: any): string | null {
+  try {
+    const c = createCanvas(8, 8);
+    const x = c.getContext('2d');
+    x.drawImage(img, 0, 0, 8, 8);
+    const data = x.getImageData(0, 0, 8, 8).data;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    for (let k = 0; k < data.length; k += 4) {
+      r += data[k];
+      g += data[k + 1];
+      b += data[k + 2];
+    }
+    const n = data.length / 4;
+    const hex = (v: number) => Math.round(v / n).toString(16).padStart(2, '0');
+    return `#${hex(r)}${hex(g)}${hex(b)}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Эмодзи и прочие символы, которых нет в шрифте карточки (иначе будут квадратики) */
+const stripEmoji = (t: string) =>
+  t
+    .replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}\u{1F3FB}-\u{1F3FF}️‍⃣]/gu, '')
+    .replace(/<a?:\w+:\d+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** Картинка эмодзи статуса: своё эмодзи сервера — с CDN Discord, обычное — Twemoji */
+async function statusEmoji(emoji: any): Promise<any | null> {
+  if (!emoji) return null;
+  try {
+    if (emoji.id) return await remoteImage(`https://cdn.discordapp.com/emojis/${emoji.id}.png?size=96`);
+    const ch: string = emoji.name ?? '';
+    if (!ch) return null;
+    let cps = [...ch].map((c) => c.codePointAt(0)!.toString(16));
+    if (!cps.includes('200d')) cps = cps.filter((c) => c !== 'fe0f');
+    return await remoteImage(`https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/${cps.join('-')}.png`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Статус «как в профиле» на момент входа. Нужен Presence Intent (PRESENCE_INTENT=true в .env
+ * и переключатель в Developer Portal). Сразу после входа Discord присылает статус не мгновенно — ждём до 4 секунд.
+ */
+async function presenceOf(member: GuildMember) {
+  if (process.env.PRESENCE_INTENT !== 'true') return null;
+  for (let k = 0; k < 8; k++) {
+    const p = member.guild.presences.cache.get(member.id) ?? member.presence;
+    if (p) return p;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return null;
+}
+
+async function renderCard(member: GuildMember, user: any): Promise<Buffer> {
+  const canvas = createCanvas(CARD_W, CARD_H);
   const ctx = canvas.getContext('2d');
 
-  const accent: string = user.hexAccentColor ?? '#e8a33d';
+  const avatar = await remoteImage(member.displayAvatarURL({ extension: 'png', size: 256 })).catch(() => null);
 
-  // Фон: баннер профиля → картинка из assets/welcome/ → градиент цвета профиля
-  let drewBg = false;
-  const bannerUrl: string | null = user.bannerURL?.({ extension: 'png', size: 1024 }) ?? null;
-  const bgPath = pickRandom(listImages(path.join(config.assetsDir, 'welcome')));
-  for (const src of [bannerUrl, bgPath]) {
-    if (!src || drewBg) continue;
-    try {
-      const bg = src.startsWith('http') ? await remoteImage(src) : await loadImage(fs.readFileSync(src));
-      const scale = Math.max(W / bg.width, H / bg.height);
-      ctx.drawImage(bg, (W - bg.width * scale) / 2, (H - bg.height * scale) / 2, bg.width * scale, bg.height * scale);
-      drewBg = true;
-    } catch {
-      /* попробуем следующий вариант */
-    }
-  }
-  if (!drewBg) {
-    const { r, g: gg, b } = hexToRgb(accent);
-    const g = ctx.createLinearGradient(0, 0, W, H);
-    g.addColorStop(0, '#1a1208');
-    g.addColorStop(0.5, `rgba(${r},${gg},${b},0.55)`);
-    g.addColorStop(1, accent);
-    ctx.fillStyle = '#1a1208';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, W, H);
-  }
+  const presence = await presenceOf(member);
+  const custom = presence?.activities?.find((a: any) => a.type === ActivityType.Custom);
+  const statusText = stripEmoji(custom?.state ?? '');
+  const emojiImg = await statusEmoji(custom?.emoji);
 
-  // Затемнённая плашка
-  ctx.fillStyle = 'rgba(12, 8, 4, 0.62)';
-  roundRect(ctx, 24, 24, W - 48, H - 48, 28);
-  ctx.fill();
-
-  // Аватар в кружке + рамка цвета профиля
-  const avatarSize = 200;
-  const ax = 75;
-  const ay = (H - avatarSize) / 2;
-  const cx = ax + avatarSize / 2;
-  const cy = ay + avatarSize / 2;
-  try {
-    const avatar = await remoteImage(member.displayAvatarURL({ extension: 'png', size: 256 }));
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, avatarSize / 2, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(avatar, ax, ay, avatarSize, avatarSize);
-    ctx.restore();
-  } catch {
-    /* без аватара — не страшно */
-  }
-
-  // Украшение аватарки из магазина Discord, если есть — рисуем поверх вместо обычной рамки
-  let decorated = false;
-  const decoUrl: string | null =
-    typeof user.avatarDecorationURL === 'function' ? user.avatarDecorationURL({ size: 256 }) : null;
-  if (decoUrl) {
-    try {
-      const deco = await remoteImage(decoUrl);
-      const ds = avatarSize * 1.2;
-      ctx.drawImage(deco, cx - ds / 2, cy - ds / 2, ds, ds);
-      decorated = true;
-    } catch {
-      /* без украшения */
-    }
-  }
-  if (!decorated) {
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 8;
-    ctx.beginPath();
-    ctx.arc(cx, cy, avatarSize / 2 + 4, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // Утка справа (случайная из assets/ducks/)
-  const duckPath = pickRandom(listImages(path.join(config.assetsDir, 'ducks')));
-  let textRight = W - 60;
-  if (duckPath) {
-    try {
-      const duck = await loadImage(fs.readFileSync(duckPath));
-      const dh = 300;
-      const dw = (duck.width / duck.height) * dh;
-      const dx = W - 50 - dw;
-      ctx.drawImage(duck, dx, (H - dh) / 2, dw, dh);
-      textRight = dx - 20;
-    } catch (e) {
-      console.warn('[welcome] Не удалось загрузить утку', duckPath, (e as Error).message);
-    }
-  }
-
-  // Текст
-  const tx = ax + avatarSize + 55;
-  const maxW = textRight - tx;
-  ctx.fillStyle = '#f7d9a8';
-  fitText(ctx, title, maxW, 36);
-  ctx.fillText(title, tx, 120);
-
-  ctx.fillStyle = '#ffffff';
-  const name = member.displayName;
-  fitText(ctx, name, maxW, 60, 28);
-  ctx.fillText(name, tx, 188);
-
-  // Плашки: номер, возраст аккаунта, значки профиля
-  const pills: { text: string; color?: string }[] = [
-    { text: `Посетитель №${member.guild.memberCount}` },
-    { text: `В Discord с ${member.user.createdAt.getFullYear()}` },
-  ];
-  const flags: string[] = user.flags?.toArray?.() ?? [];
-  for (const f of flags) {
-    const b = BADGES[f];
-    if (b) pills.push({ text: b[0], color: b[1] });
-  }
-  drawPills(ctx, pills, tx, 222, maxW);
-
+  const color = normalizeCardColor(user.hexAccentColor ?? (avatar && averageColor(avatar)) ?? '#c98a2b');
+  drawClubCard(ctx, {
+    name: stripEmoji(member.displayName) || member.user.username,
+    avatar,
+    color,
+    presence: (presence?.status as any) ?? null,
+    status: statusText || emojiImg ? { text: statusText, emoji: emojiImg } : null,
+    font: FONT,
+  });
   return canvas.encode('png');
 }

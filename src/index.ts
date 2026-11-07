@@ -26,6 +26,9 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, // нужен включённый Server Members Intent в Developer Portal
     GatewayIntentBits.GuildVoiceStates,
+    // Статус «как в профиле» на приветственной карте. Нужен Presence Intent в Developer Portal,
+    // поэтому включается только по PRESENCE_INTENT=true в .env (без переключателя в портале бот не запустится)
+    ...(process.env.PRESENCE_INTENT === 'true' ? [GatewayIntentBits.GuildPresences] : []),
   ],
   // Бот никогда не пингует @everyone, @here и роли — даже если такой текст придёт из названия трека, станции или новости
   allowedMentions: { parse: ['users'] },

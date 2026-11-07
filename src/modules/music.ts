@@ -361,11 +361,8 @@ async function searchByText(text: string, requester: unknown): Promise<LoadResul
   for (const prefix of ['scsearch', 'bcsearch']) {
     const res = await loadTracks(`${prefix}:${text}`, requester);
     if (res.tracks.length) {
-      // Только оригиналы: ремиксы, slowed, каверы и т.п. — лишь если они есть в самом запросе
-      const clean = res.tracks.filter((t) => !isAltered(t, text));
-      if (clean.length) return { ...res, tracks: clean };
-      last = { kind: 'empty', tracks: [] };
-      continue;
+      // Сначала оригиналы; ремиксы, каверы и slowed — только если оригинала нет совсем
+      return { ...res, tracks: byTier(res.tracks, text) };
     }
     if (res.kind === 'error') console.warn(`[music] ${prefix} «${text}»: ${res.error}`);
     last = res;
@@ -524,7 +521,7 @@ function markBad(uri?: string | null) {
 
 /** Прикрепляет к треку запасные варианты — если он не заиграет, бот попробует следующий */
 function withAlternatives(main: Track, others: Track[]): Track {
-  const alts = others.map((t) => t.info.uri).filter((u): u is string => !!u && u !== main.info.uri && !isBad(u)).slice(0, 4);
+  const alts = others.map((t) => t.info.uri).filter((u): u is string => !!u && u !== main.info.uri && !isBad(u)).slice(0, 6);
   (main as any).userData = { ...((main as any).userData ?? {}), alts };
   return main;
 }
@@ -565,6 +562,31 @@ function isAltered(t: Track, wanted: string): boolean {
   }
   return false;
 }
+/** Замедленные/ускоренные/«с эффектами» версии — самые нежелательные */
+const SPEED_ALTERED = /(?<=^| )(slowed|sped ?up|speed ?up|nightcore|daycore|reverb|8d|bass ?boost(?:ed)?|медлен\S*|ускор\S*|замедл\S*)(?= |$)/u;
+
+/**
+ * Насколько версия близка к запросу: 0 — оригинал, 1 — другая версия (ремикс, кавер, лайв),
+ * 2 — slowed/sped up/nightcore и т.п. Бот всегда берёт самый низкий уровень, который нашёлся,
+ * чтобы трек всё-таки заиграл, даже если оригинала на SoundCloud нет.
+ */
+function versionTier(t: Track, wanted: string): 0 | 1 | 2 {
+  if (!isAltered(t, wanted)) return 0;
+  const m = norm(t.info.title ?? '').match(SPEED_ALTERED);
+  return m && !norm(wanted).includes(norm(m[0])) ? 2 : 1;
+}
+
+/** Сортирует результаты: сначала оригиналы, потом другие версии, slowed и подобное — в самом конце */
+function byTier(tracks: Track[], wanted: string, score?: (t: Track) => number): Track[] {
+  return tracks
+    .map((t, k) => ({ t, k, tier: versionTier(t, wanted), s: score?.(t) ?? 0 }))
+    .sort((a, b) => a.tier - b.tier || b.s - a.s || a.k - b.k)
+    .map((x) => {
+      (x.t as any).userData = { ...((x.t as any).userData ?? {}), wanted, notOriginal: x.tier > 0 };
+      return x.t;
+    });
+}
+
 /** Слова, которые могут стоять перед «remix» и не являются именем автора */
 const NOT_ORIGINAL_SOFT = new Set(['official', 'original', 'the', 'feat', 'ft', 'x', 'и', 'and']);
 
@@ -597,14 +619,10 @@ async function findOnSoundCloud(artist: string, title: string, requester: unknow
   const q = `${artist} ${title}`.trim();
   if (!q) return undefined;
   const res = await loadTracks(`scsearch:${q}`, requester);
-  const ok = res.tracks.filter(
-    (t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri) && !isAltered(t, q),
-  );
+  const ok = res.tracks.filter((t) => !t.info.isStream && (t.info.duration ?? 0) > PREVIEW_MAX_MS && !isBad(t.info.uri));
   if (!ok.length) return undefined;
-  const ranked = ok
-    .map((t, k) => ({ t, k, s: originalScore(t, artist, title, durationMs) }))
-    .sort((x, y) => y.s - x.s || x.k - y.k)
-    .map((x) => x.t);
+  // Оригиналы впереди; если основной не заиграет, запасные пойдут в том же порядке
+  const ranked = byTier(ok, q, (t) => originalScore(t, artist, title, durationMs));
   return withAlternatives(ranked[0], ranked.slice(1));
 }
 
@@ -665,7 +683,13 @@ async function onTrackFailed(client: Client, player: Player, track: any) {
       markBad(alts[k]);
       continue;
     }
-    (alt as any).userData = { ...((alt as any).userData ?? {}), alts: alts.slice(k + 1) };
+    const wanted: string | undefined = track?.userData?.wanted;
+    (alt as any).userData = {
+      ...((alt as any).userData ?? {}),
+      alts: alts.slice(k + 1),
+      wanted,
+      notOriginal: wanted ? versionTier(alt, wanted) > 0 : false,
+    };
     await player.queue.add(alt, 0);
     console.log(`[music] «${track?.info?.title}» не играет — пробую другую загрузку: ${alt.info.title}`);
     await refreshPanel(player);
@@ -747,7 +771,7 @@ async function enqueue(
       console.warn(`[music] Ошибка загрузки: ${res.error}`);
       return i.editReply(`⚠️ Не получилось загрузить трек: ${truncate(res.error ?? '', 200)}`);
     }
-    return i.editReply('🔍 Оригинал не нашёл. Ремиксы, slowed, каверы и лайвы бот не включает, если их нет в запросе: хочешь ремикс — так и напиши, например «Dracula JENNIE remix». Или попробуй «исполнитель — название».');
+    return i.editReply('🔍 Ничего не нашёл. Попробуй по-другому: «исполнитель — название» или ссылку.');
   }
 
   // Ссылки Spotify: сам Spotify не играем — находим треки на SoundCloud
@@ -781,6 +805,7 @@ async function enqueue(
     if (fileName) (full.info as any).title = fileName;
     added = [full];
     label = `➕ В очереди: **${plain(truncate(full.info.title, 80))}** (${full.info.isStream ? 'эфир' : formatDuration(full.info.duration)})`;
+    if ((full as any).userData?.notOriginal) label += '\n-# ⚠️ Оригинала на SoundCloud нет — включаю ближайшую версию.';
   }
 
   if (!player) {
@@ -1336,6 +1361,9 @@ function panelPayload(player: Player) {
       { name: 'Повтор', value: repeatLabel(player.repeatMode), inline: true },
     )
     .setFooter({ text: `В очереди: ${player.queue.tracks.length} • DJ-режим: ${djModeOn() ? 'вкл' : 'выкл'}` });
+  if ((track as any).userData?.notOriginal) {
+    embed.addFields({ name: '⚠️ Не оригинал', value: 'Официальная версия на SoundCloud недоступна — играет ближайшая найденная.' });
+  }
   const uri = safeUrl(info.uri);
   if (uri) embed.setURL(uri);
   const art = safeUrl(info.artworkUrl);
