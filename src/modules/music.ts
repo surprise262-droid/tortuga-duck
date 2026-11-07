@@ -361,10 +361,11 @@ async function searchByText(text: string, requester: unknown): Promise<LoadResul
   for (const prefix of ['scsearch', 'bcsearch']) {
     const res = await loadTracks(`${prefix}:${text}`, requester);
     if (res.tracks.length) {
-      // Замедленные/ускоренные версии — в конец списка (если их не искали специально)
-      const normal = res.tracks.filter((t) => !isAltered(t, text));
-      const altered = res.tracks.filter((t) => isAltered(t, text));
-      return { ...res, tracks: [...normal, ...altered] };
+      // Только оригиналы: ремиксы, slowed, каверы и т.п. — лишь если они есть в самом запросе
+      const clean = res.tracks.filter((t) => !isAltered(t, text));
+      if (clean.length) return { ...res, tracks: clean };
+      last = { kind: 'empty', tracks: [] };
+      continue;
     }
     if (res.kind === 'error') console.warn(`[music] ${prefix} «${text}»: ${res.error}`);
     last = res;
@@ -537,13 +538,35 @@ const JUNK_WORDS = /(cover|remix|flip|mash ?-?up|slowed|reverb|sped ?up|speed ?u
 const plainLetters = (x: string) => x.normalize('NFKC');
 const norm = (x: string) => plainLetters(x).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
-/** Версии с изменённой скоростью/звуком: их не берём вообще, если человек сам их не искал */
-const ALTERED = /(slowed|sped ?up|speed ?up|nightcore|reverb|\b8d\b|bass ?boost|daycore|медлен|ускор|замедл)/i;
+/** Слова «не оригинала»: ремиксы, slowed/sped up, каверы, лайвы и т.п. (после приведения букв к обычным) */
+const NOT_ORIGINAL =
+  /(?<=^| )(remix|rmx|cover|flip|mash ?up|bootleg|slowed|sped ?up|speed ?up|nightcore|daycore|reverb|karaoke|instrumental|live|edit|8d|bass ?boost(?:ed)?|lo ?fi|acoustic|piano|tribute|8 ?bit|version|vip|кавер|ремикс|караоке|минус|медлен\S*|ускор\S*|замедл\S*)(?= |$)/gu;
 
+/**
+ * true — загрузка НЕ подходит: в её названии есть «ремикс/slowed/кавер…», которого нет в запросе,
+ * или это ремикс другого автора (в запросе «JENNIE Remix», а загрузка — «Emeril Remix»).
+ */
 function isAltered(t: Track, wanted: string): boolean {
-  const m = plainLetters(t.info.title ?? '').match(ALTERED);
-  return !!m && !norm(wanted).includes(norm(m[0]));
+  const cand = norm(t.info.title ?? '');
+  const want = norm(wanted);
+  const wantWords = want.split(' ');
+  const candWords = cand.split(' ');
+  for (const m of cand.matchAll(NOT_ORIGINAL)) {
+    const w = norm(m[0]);
+    if (!w) continue;
+    const first = w.split(' ')[0];
+    const wi = wantWords.indexOf(first);
+    if (wi < 0) return true; // в запросе такого не было
+    // Слово было в запросе — проверим, что это тот же автор ремикса/версии (слово перед ним)
+    const ci = candWords.indexOf(first);
+    const prevWant = wantWords[wi - 1];
+    const prevCand = candWords[ci - 1];
+    if (prevWant && prevCand && prevWant !== prevCand && !NOT_ORIGINAL_SOFT.has(prevCand)) return true;
+  }
+  return false;
 }
+/** Слова, которые могут стоять перед «remix» и не являются именем автора */
+const NOT_ORIGINAL_SOFT = new Set(['official', 'original', 'the', 'feat', 'ft', 'x', 'и', 'and']);
 
 /**
  * Насколько загрузка похожа на оригинал: штраф за «cover/remix/slowed…» (если их не искали),
@@ -724,7 +747,7 @@ async function enqueue(
       console.warn(`[music] Ошибка загрузки: ${res.error}`);
       return i.editReply(`⚠️ Не получилось загрузить трек: ${truncate(res.error ?? '', 200)}`);
     }
-    return i.editReply('🔍 Ничего не нашёл. Попробуй по-другому: «исполнитель — название» или ссылку.');
+    return i.editReply('🔍 Оригинал не нашёл. Ремиксы, slowed, каверы и лайвы бот не включает, если их нет в запросе: хочешь ремикс — так и напиши, например «Dracula JENNIE remix». Или попробуй «исполнитель — название».');
   }
 
   // Ссылки Spotify: сам Spotify не играем — находим треки на SoundCloud
