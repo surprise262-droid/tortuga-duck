@@ -18,8 +18,9 @@ import * as trailers from './modules/trailers';
 import * as stations from './modules/stations';
 import * as cleanup from './modules/cleanup';
 import * as watchlist from './modules/watchlist';
+import * as watchorder from './modules/watchorder';
 
-const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games, movies, trailers, stations, cleanup, watchlist];
+const modules: BotModule[] = [general, setupModule, music, privateVoice, welcome, roles, news, anime, games, movies, trailers, stations, cleanup, watchlist, watchorder];
 
 const client = new Client({
   intents: [

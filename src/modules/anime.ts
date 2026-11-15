@@ -461,3 +461,21 @@ export async function animeInfo(id: number): Promise<PremiereInfo | null> {
     link: { label: 'Shikimori', url: `${base}/animes/${a.id}` },
   };
 }
+
+// ───────────────────────── доступ к Shikimori для хронологии ─────────────────────────
+
+/** Русские названия по id (id Shikimori = id MyAnimeList), до 50 за запрос */
+export async function shikiRussianNames(ids: number[]): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  const cfg = loadCfg();
+  for (let k = 0; k < ids.length; k += 50) {
+    const part = ids.slice(k, k + 50);
+    try {
+      const { data } = await shikiGet(cfg, `/api/animes?ids=${part.join(',')}&limit=50`);
+      for (const a of Array.isArray(data) ? data : []) if (a?.id && a.russian) out.set(Number(a.id), a.russian);
+    } catch {
+      /* не страшно — останутся английские названия */
+    }
+  }
+  return out;
+}

@@ -540,3 +540,19 @@ export async function tmdbInfo(kind: 'movie' | 'tv', id: number, season?: number
     link: { label: 'TMDB', url: `https://themoviedb.org/${kind}/${d.id}` },
   };
 }
+
+// ───────────────────────── доступ к TMDB для хронологии ─────────────────────────
+
+/** Запрос к TMDB для других модулей (хронология, расписание серий). null — ключ не задан. */
+export async function tmdbGet(path: string, params: Record<string, string | number> = {}): Promise<any | null> {
+  if (keyMissing()) return null;
+  return tmdb(path, { language: loadCfg().language, ...params });
+}
+
+/** Название на русском, а если оно в «нечитаемом» алфавите (иероглифы и т.п.) — на английском */
+export async function tmdbTitle(kind: 'movie' | 'tv', d: any): Promise<string> {
+  const title: string = (kind === 'movie' ? d?.title || d?.original_title : d?.name || d?.original_name) ?? '';
+  if (title && readable(title)) return title;
+  const en = await tmdb(`/${kind}/${d.id}`, { language: 'en-US' }).catch(() => null);
+  return (kind === 'movie' ? en?.title : en?.name) || title;
+}

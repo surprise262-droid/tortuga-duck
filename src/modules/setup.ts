@@ -12,6 +12,7 @@ import { resetMoviesAnnounce, runMoviesNow } from './movies';
 import { resetCategory, runNewsNow } from './news';
 import { postControlPanel } from './privateVoice';
 import { postRolesPanel } from './roles';
+import { postWatchorderPanel } from './watchorder';
 
 /** Назначения каналов: [ключ, подпись, нужен голосовой?] */
 export const CHANNEL_PURPOSES: [string, string, boolean][] = [
@@ -28,6 +29,7 @@ export const CHANNEL_PURPOSES: [string, string, boolean][] = [
   ['games_announce', 'Игры: релизы и календарь', false],
   ['movies_announce', 'Кино и сериалы: премьеры и календарь', false],
   ['reminders', 'Напоминания о премьерах (личные ветки)', false],
+  ['watchorder', 'Хронология просмотра (панель)', false],
 ];
 
 const ROLE_PURPOSES: [string, string][] = [
@@ -129,6 +131,11 @@ export async function onCommand(i: ChatInputCommandInteraction) {
     if (purpose === 'vc_control' && i.guild) {
       await postControlPanel(i.guild, channel.id);
       extra = '\nПанель управления приватками отправлена в канал.';
+    }
+    if (purpose === 'watchorder' && i.guild) {
+      if (previous !== channel.id) setSetting('wo.panel', null);
+      await postWatchorderPanel(i.guild, channel.id);
+      extra = '\nПанель «Хронология просмотра» отправлена и закреплена. Ответы на поиск видит только тот, кто искал.';
     }
     if (purpose === 'roles' && i.guild) {
       await postRolesPanel(i.guild, channel.id);

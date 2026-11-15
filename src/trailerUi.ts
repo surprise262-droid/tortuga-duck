@@ -69,6 +69,9 @@ export function cardButtons(source: TrailerSource, id: number | string, hasTrail
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`watch:r:${source}:${id}`).setLabel('Напомнить').setEmoji('🔔').setStyle(ButtonStyle.Secondary),
   );
+  if (source === 'shiki' || source === 'tmdbt') {
+    row.addComponents(new ButtonBuilder().setCustomId(`wo:sched:${source}:${id}`).setEmoji('🗓').setLabel('Серии').setStyle(ButtonStyle.Secondary));
+  }
   if (calendarUrl) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(calendarUrl).setEmoji('📅').setLabel('Календарь'));
   return [row];
 }

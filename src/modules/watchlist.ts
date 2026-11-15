@@ -129,6 +129,10 @@ function miniCard(info: PremiereInfo, userId: string) {
       .setDisabled(!!mark?.watch && !mark?.remind),
     new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(info.link.url).setLabel(info.link.label),
   );
+  // Аниме и сериалы — расписание серий (modules/watchorder.ts)
+  if (info.source === 'shiki' || info.source === 'tmdbt') {
+    row.addComponents(new ButtonBuilder().setCustomId(`wo:sched:${info.source}:${info.id}`).setLabel('Серии').setEmoji('📅').setStyle(ButtonStyle.Secondary));
+  }
   return { embeds: [e], components: [row] };
 }
 
