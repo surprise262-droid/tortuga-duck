@@ -1,13 +1,18 @@
+import { createCanvas, loadImage } from '@napi-rs/canvas';
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
   Events,
   MessageFlags,
   ModalBuilder,
+  SlashCommandBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
+  type AutocompleteInteraction,
+  type ChatInputCommandInteraction,
   TextInputStyle,
   type Client,
   type Guild,
@@ -16,8 +21,10 @@ import { createHash } from 'node:crypto';
 import { getSetting, setSetting } from '../db';
 import type { ComponentInteraction } from '../types';
 import { plain, readConfigJson, truncate } from '../util';
-import { shikiRussianNames } from './anime';
+import { shikiRussianNames, shikiSearch } from './anime';
 import { tmdbGet, tmdbTitle } from './movies';
+import { FONT } from './welcome';
+import { COLS_MAX, drawPosterStrip, stripSize, type StripItem } from '../posterStrip';
 
 /**
  * «Хронология просмотра»: панель в отдельном канале (/setup channel → «Хронология просмотра»).
@@ -33,6 +40,24 @@ import { tmdbGet, tmdbTitle } from './movies';
 
 export const componentPrefix = 'wo';
 
+/** /watchorder (в русском Discord — /хронология) с подсказками по мере ввода, как у /play */
+export const commands = [
+  new SlashCommandBuilder()
+    .setName('watchorder')
+    .setNameLocalizations({ ru: 'хронология' })
+    .setDescription('Order to watch: all parts, prequels, sequels and episode schedule')
+    .setDescriptionLocalizations({ ru: 'В каком порядке смотреть: все части, приквелы, сиквелы и расписание серий' })
+    .addStringOption((o) =>
+      o
+        .setName('query')
+        .setNameLocalizations({ ru: 'название' })
+        .setDescription('Anime, series, movie or universe')
+        .setDescriptionLocalizations({ ru: 'Аниме, сериал, фильм или вселенная' })
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+];
+
 type Tag = 'main' | 'side' | 'skip' | 'alt';
 const TAG_TEXT: Record<Tag, string> = { main: '', side: ' · ➕ побочная', skip: ' · ⏭ можно пропустить', alt: ' · 🔀 другая версия' };
 
@@ -46,6 +71,10 @@ interface Entry {
   /** Значение для мини-карточки watchlist: shiki:<malId> | tmdbm:<id> | tmdbt:<id> */
   pick?: string;
   airing?: boolean;
+  /** Оценка 0–10 (AniList/TMDB) */
+  score?: number;
+  /** Постер (для полосы постеров фильмов) */
+  poster?: string;
 }
 
 interface Episode {
@@ -57,13 +86,14 @@ interface Episode {
 
 interface Franchise {
   title: string;
+  poster?: string;
   release: Entry[];
   events: Entry[];
   /** откуда взят порядок по событиям */
   eventsNote: string;
   note?: string;
   truncated?: boolean;
-  schedule?: { title: string; episodes: Episode[] };
+  schedule?: { title: string; episodes: Episode[]; total?: number };
 }
 
 // ───────────────────────── AniList ─────────────────────────
@@ -89,7 +119,7 @@ async function anilist(query: string, variables: Record<string, unknown>): Promi
   throw new Error('AniList: слишком много запросов, попробуй через минуту');
 }
 
-const MEDIA_FIELDS = `id idMal format status episodes seasonYear
+const MEDIA_FIELDS = `id idMal format status episodes seasonYear averageScore coverImage { large }
   startDate { year month day }
   title { romaji english }
   nextAiringEpisode { episode airingAt }
@@ -172,6 +202,8 @@ async function animeFranchise(rootId: number): Promise<Franchise> {
     tag: tagOf.get(m.id) ?? 'side',
     pick: m.idMal ? `shiki:${m.idMal}` : undefined,
     airing: m.status === 'RELEASING',
+    score: m.averageScore ? m.averageScore / 10 : undefined,
+    poster: m.coverImage?.large,
   });
 
   const byDate = (a: any, b: any) => (aniDate(a.startDate) ?? '9999').localeCompare(aniDate(b.startDate) ?? '9999');
@@ -210,10 +242,11 @@ async function animeFranchise(rootId: number): Promise<Franchise> {
   let schedule: Franchise['schedule'];
   if (airingNode) {
     const eps = await animeSchedule(airingNode.id).catch(() => []);
-    if (eps.length) schedule = { title: entry(airingNode).title, episodes: eps };
+    if (eps.length) schedule = { title: entry(airingNode).title, episodes: eps, total: airingNode.episodes ?? undefined };
   }
   return {
     title: root ? entry(root).title : 'Аниме',
+    poster: root?.coverImage?.large,
     release: release.map(entry),
     events: events.map(entry),
     eventsNote: 'по сюжетным связям (приквел → сиквел), примерно',
@@ -231,7 +264,7 @@ async function animeSchedule(anilistId: number): Promise<Episode[]> {
 }
 
 /** Расписание по id Shikimori/MAL — для кнопки в анонсах */
-async function animeScheduleByMal(malId: number): Promise<{ title: string; episodes: Episode[] } | null> {
+async function animeScheduleByMal(malId: number): Promise<{ title: string; episodes: Episode[]; total?: number } | null> {
   const data = await anilist(
     `query ($id: Int) { Media(idMal: $id, type: ANIME) { id title { romaji english } episodes airingSchedule(perPage: 50) { nodes { episode airingAt } } } }`,
     { id: malId },
@@ -241,15 +274,17 @@ async function animeScheduleByMal(malId: number): Promise<{ title: string; episo
   const ru = await shikiRussianNames([malId]);
   return {
     title: ru.get(malId) || m.title?.english || m.title?.romaji,
+    total: m.episodes ?? undefined,
     episodes: (m.airingSchedule?.nodes ?? []).map((n: any) => ({ ep: n.episode, at: n.airingAt })),
   };
 }
 
 // ───────────────────────── TMDB ─────────────────────────
 
+const tmdbPoster = (p?: string | null) => (p ? `https://image.tmdb.org/t/p/w342${p}` : undefined);
 const noon = (ymd: string) => Math.floor(Date.parse(`${ymd}T12:00:00Z`) / 1000);
 
-async function tvSchedule(tvId: number, d?: any): Promise<{ title: string; episodes: Episode[] } | null> {
+async function tvSchedule(tvId: number, d?: any): Promise<{ title: string; episodes: Episode[]; total?: number } | null> {
   const show = d ?? (await tmdbGet(`/tv/${tvId}`));
   if (!show) return null;
   const season = show.next_episode_to_air?.season_number ?? show.last_episode_to_air?.season_number;
@@ -258,7 +293,7 @@ async function tvSchedule(tvId: number, d?: any): Promise<{ title: string; episo
   const episodes: Episode[] = (s?.episodes ?? [])
     .filter((e: any) => e.air_date)
     .map((e: any) => ({ ep: e.episode_number, at: noon(e.air_date), dateOnly: true }));
-  return { title: `${await tmdbTitle('tv', show)} — ${season} сезон`, episodes };
+  return { title: `${await tmdbTitle('tv', show)} — ${season} сезон`, episodes, total: s?.episodes?.length || undefined };
 }
 
 async function movieFranchise(movieId: number): Promise<Franchise> {
@@ -274,11 +309,14 @@ async function movieFranchise(movieId: number): Promise<Franchise> {
       date: p.release_date || null,
       tag: 'main',
       pick: `tmdbm:${p.id}`,
+      score: p.vote_average || undefined,
+      poster: tmdbPoster(p.poster_path),
     });
   }
   entries.sort((a, b) => (a.date ?? '9999').localeCompare(b.date ?? '9999'));
   return {
-    title: coll?.name ?? (await tmdbTitle('movie', m)),
+    title: (coll?.name ?? (await tmdbTitle('movie', m))).replace(/\s*\((Коллекция|Collection)\)\s*$/i, ''),
+    poster: tmdbPoster(coll?.poster_path ?? m.poster_path),
     release: entries,
     events: entries,
     eventsNote: 'для серии фильмов TMDB знает только порядок выхода',
@@ -300,13 +338,14 @@ async function tvFranchise(tvId: number): Promise<Franchise> {
       tag: s.season_number === 0 ? 'skip' : 'main',
       pick: `tmdbt:${d.id}`,
       airing: d.next_episode_to_air?.season_number === s.season_number,
+      score: s.vote_average || undefined,
     }));
   let schedule: Franchise['schedule'];
   if (d.next_episode_to_air) {
     const sch = await tvSchedule(tvId, d).catch(() => null);
     if (sch?.episodes.length) schedule = sch;
   }
-  return { title, release: entries, events: entries, eventsNote: 'сезоны по порядку', schedule };
+  return { title, poster: tmdbPoster(d.poster_path), release: entries, events: entries, eventsNote: 'сезоны по порядку', schedule };
 }
 
 // ───────────────────────── ручные хронологии ─────────────────────────
@@ -328,7 +367,7 @@ const universes = () => readConfigJson<{ universes?: Universe[] }>('watchorders.
 
 /** Найденный id для записи ручного списка запоминаем в базе — поиск по названию нужен один раз */
 async function resolveItem(it: CuratedItem): Promise<Entry | null> {
-  const key = `wo.res.${createHash('sha1').update(`${it.type}|${it.q}|${it.year ?? ''}`).digest('hex').slice(0, 16)}`;
+  const key = `wo.res2.${createHash('sha1').update(`${it.type}|${it.q}|${it.year ?? ''}`).digest('hex').slice(0, 16)}`;
   const cached = getSetting(key);
   if (cached) {
     try {
@@ -340,7 +379,7 @@ async function resolveItem(it: CuratedItem): Promise<Entry | null> {
   let e: Entry | null = null;
   if (it.type === 'anime') {
     const data = await anilist(
-      `query ($q: String) { Page(perPage: 8) { media(search: $q, type: ANIME, sort: SEARCH_MATCH) { id idMal format startDate { year month day } episodes title { romaji english } } } }`,
+      `query ($q: String) { Page(perPage: 8) { media(search: $q, type: ANIME, sort: SEARCH_MATCH) { id idMal format averageScore coverImage { large } startDate { year month day } episodes title { romaji english } } } }`,
       { q: it.q },
     );
     const list: any[] = data?.Page?.media ?? [];
@@ -354,6 +393,8 @@ async function resolveItem(it: CuratedItem): Promise<Entry | null> {
         episodes: m.episodes ?? undefined,
         tag: 'main',
         pick: m.idMal ? `shiki:${m.idMal}` : undefined,
+        score: m.averageScore ? m.averageScore / 10 : undefined,
+        poster: m.coverImage?.large,
       };
     }
   } else {
@@ -369,6 +410,8 @@ async function resolveItem(it: CuratedItem): Promise<Entry | null> {
         date: (kind === 'movie' ? m.release_date : m.first_air_date) || null,
         tag: 'main',
         pick: `${kind === 'movie' ? 'tmdbm' : 'tmdbt'}:${m.id}`,
+        score: m.vote_average || undefined,
+        poster: tmdbPoster(m.poster_path),
       };
     }
   }
@@ -412,6 +455,12 @@ async function franchise(key: string): Promise<Franchise> {
     const [kind, id] = [key.slice(0, 1), key.slice(2)];
     const job = (async () => {
       if (kind === 'a') return animeFranchise(Number(id));
+      if (kind === 's') {
+        // Найдено через Shikimori (по-русски) — переводим id MyAnimeList в id AniList
+        const d = await anilist(`query ($id: Int) { Media(idMal: $id, type: ANIME) { id } }`, { id: Number(id) });
+        if (!d?.Media?.id) throw new Error('этого аниме нет в AniList — хронологию собрать не получится');
+        return animeFranchise(d.Media.id);
+      }
       if (kind === 'm') return movieFranchise(Number(id));
       if (kind === 't') return tvFranchise(Number(id));
       const u = universes().find((x) => x.key === id);
@@ -431,85 +480,250 @@ async function franchise(key: string): Promise<Franchise> {
 
 // ───────────────────────── вид ─────────────────────────
 
-const year = (d: string | null) => (d ? d.slice(0, 4) : 'дата не объявлена');
+/** Обрезка без склейки строк (truncate из util схлопывает переносы — для списков не годится) */
+const clip = (t: string, n: number) => (t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t);
 
-function entryLine(e: Entry, n: number) {
-  const parts = [e.kind, e.episodes ? `${e.episodes} сер.` : '', year(e.date)].filter(Boolean).join(' · ');
-  const title = plain(truncate(e.title, 70));
-  return `\`${String(n).padStart(2, ' ')}\` ${e.tag === 'main' ? `**${title}**` : title} · ${parts}${TAG_TEXT[e.tag]}${e.airing ? ' · 🔴 выходит' : ''}`;
+const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+const year = (d: string | null) => (d ? d.slice(0, 4) : 'дата не объявлена');
+/** Будущие премьеры — полной датой, прошедшие — годом */
+function when(d: string | null): string {
+  if (!d) return 'дата не объявлена';
+  if (d.length < 10 || d <= new Date().toISOString().slice(0, 10)) return d.slice(0, 4);
+  const [y, m, day] = d.split('-').map(Number);
+  return `выйдет ${day} ${MONTHS[m - 1]} ${y}`;
 }
 
-function scheduleText(s: { episodes: Episode[] }, max = 5): string {
+const KIND_EMOJI = (k: string) => (k === 'фильм' ? '🎬' : k === 'сериал' || k.startsWith('TV') ? '📺' : k === 'клип' ? '🎵' : '💿');
+const TAG_LINE: Record<Tag, string> = { main: '', side: '➕ побочная', skip: '⏭ можно пропустить', alt: '🔀 другая версия' };
+
+/** Одна часть = две строки: название и мелкая строка с деталями */
+function entryBlock(e: Entry, n: number): string {
+  const head = `**${n}.** ${e.tag === 'main' ? `**${plain(clip(e.title, 80))}**` : plain(clip(e.title, 80))}${e.airing ? ' 🔴' : ''}`;
+  const details = [
+    `${KIND_EMOJI(e.kind)} ${e.kind}${e.episodes && e.kind !== 'фильм' ? `, ${e.episodes} сер.` : ''}`,
+    when(e.date),
+    e.score ? `⭐ ${e.score.toFixed(1)}` : '',
+    TAG_LINE[e.tag],
+    e.airing ? 'выходит сейчас' : '',
+  ].filter(Boolean);
+  return `${head}\n-# ${details.join(' · ')}`;
+}
+
+/**
+ * Отдельный блок-предупреждение «ещё выходит»: прогресс, следующая серия крупно,
+ * вышедшие серии свёрнуты в одну строку, оставшиеся — списком с датами.
+ */
+function scheduleEmbed(s: { title: string; episodes: Episode[]; total?: number }, maxLeft = 10) {
   const now = Date.now() / 1000;
   const eps = [...s.episodes].sort((a, b) => a.at - b.at);
-  const nextIdx = eps.findIndex((e) => e.at > now);
-  if (!eps.length) return 'Расписание пока не объявлено.';
-  const start = Math.max(0, (nextIdx < 0 ? eps.length : nextIdx) - 1);
-  const shown = eps.slice(start, start + max);
-  const lines = shown.map((e) => {
-    const t = e.dateOnly ? `<t:${e.at}:D>` : `<t:${e.at}:f>`;
-    if (e.at <= now) return `✅ Серия ${e.ep} — ${t}`;
-    if (e === eps[nextIdx]) return `➡️ **Серия ${e.ep} — ${t} (<t:${e.at}:R>)**`;
-    return `▫️ Серия ${e.ep} — ${t}`;
-  });
-  const rest = eps.length - (start + shown.length);
-  if (rest > 0) lines.push(`-# …и ещё ${rest} сер. — последняя <t:${eps[eps.length - 1].at}:D>`);
-  if (nextIdx < 0) lines.push('-# Все серии уже вышли.');
-  return lines.join('\n');
+  const e = new EmbedBuilder().setColor(0xe8a33d);
+  if (!eps.length) return e.setTitle(`📅 ${clip(s.title, 230)}`).setDescription('Расписание серий пока не объявлено. Обычно оно появляется ближе к премьере.');
+
+  const aired = eps.filter((x) => x.at <= now);
+  const left = eps.filter((x) => x.at > now);
+  const total = Math.max(s.total ?? 0, eps[eps.length - 1].ep, eps.length);
+  const time = (x: Episode) => (x.dateOnly ? `<t:${x.at}:D>` : `<t:${x.at}:f>`);
+
+  if (!left.length) {
+    return e
+      .setColor(0x3ba55d)
+      .setTitle(`✅ ${clip(s.title, 230)} — все серии вышли`)
+      .setDescription(`Вышло ${aired.length} из ${total} серий, последняя — ${time(aired[aired.length - 1])}.`);
+  }
+
+  const done = Math.round((aired.length / total) * 10);
+  const bar = '▰'.repeat(done) + '▱'.repeat(10 - done);
+  const next = left[0];
+  const lines = [
+    `**⚠️ Сезон ещё выходит** — вышло **${aired.length} из ${total}** серий`,
+    `${bar}`,
+    '',
+    `➡️ **Следующая: серия ${next.ep} — ${time(next)}**`,
+    `-# <t:${next.at}:R>`,
+    '',
+  ];
+  if (aired.length) {
+    const first = aired[0].ep;
+    const last = aired[aired.length - 1].ep;
+    lines.push(`✅ ${first === last ? `Серия ${first} уже вышла` : `Серии ${first}–${last} уже вышли`}`);
+  }
+  for (const x of left.slice(1, maxLeft)) lines.push(`🗓 Серия ${x.ep} — ${time(x)}${x.ep === total ? ' · финал' : ''}`);
+  if (left.length > maxLeft) lines.push(`-# …и ещё ${left.length - maxLeft} сер., последняя ${time(left[left.length - 1])}`);
+  if (next.ep === total) lines[3] += ' · финал';
+  return e
+    .setTitle(`🔴 Ещё выходит: ${clip(s.title, 220)}`)
+    .setDescription(clip(lines.join('\n'), 4000))
+    .setFooter({ text: 'Время — в твоём часовом поясе' });
 }
 
-function view(key: string, f: Franchise, mode: 'rel' | 'ev') {
+const PER_PAGE = 12;
+
+/** Готовые ряды постеров (ключ: франшиза|режим|страница) */
+const stripCache = new Map<string, { at: number; pngs: Buffer[] }>();
+
+/** Постеры фильмов страницы — рядами по 4 (каждый ряд — отдельная картинка, так Discord показывает их крупнее) */
+/**
+ * Подпись под постером: общее начало серии убираем, если оно повторяется хотя бы у двух фильмов
+ * («Бегущий в лабиринте: Испытание огнём» → «Испытание огнём»), иначе оставляем название целиком
+ * («Хан Соло: Звёздные войны. Истории» так и остаётся).
+ */
+function captions(all: Entry[]): (title: string) => string {
+  const head = (t: string) => (t.indexOf(': ') > 0 ? t.slice(0, t.indexOf(': ')) : null);
+  const freq = new Map<string, number>();
+  for (const e of all) {
+    const h = head(e.title);
+    if (h) freq.set(h, (freq.get(h) ?? 0) + 1);
+  }
+  return (t) => {
+    const h = head(t);
+    return h && (freq.get(h) ?? 0) >= 2 && t.length > h.length + 4 ? t.slice(h.length + 2) : t;
+  };
+}
+
+async function posterStrip(cacheKey: string, films: { x: Entry; n: number }[], all: Entry[]): Promise<Buffer[]> {
+  const hit = stripCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < TTL) return hit.pngs;
+  const caption = captions(all.filter((e) => e.kind === 'фильм'));
+  const items: StripItem[] = await Promise.all(
+    films.map(async ({ x, n }) => {
+      let img = null;
+      if (x.poster) {
+        try {
+          const res = await fetch(x.poster, { signal: AbortSignal.timeout(8000) });
+          if (res.ok) img = await loadImage(Buffer.from(await res.arrayBuffer()));
+        } catch {
+          /* без постера — нарисуем заглушку с названием */
+        }
+      }
+      return { n, title: caption(x.title), year: year(x.date), main: x.tag === 'main', img };
+    }),
+  );
+  if (!items.some((it) => it.img)) return [];
+  const pngs: Buffer[] = [];
+  for (let k = 0; k < items.length; k += COLS_MAX) {
+    const row = items.slice(k, k + COLS_MAX);
+    const { w, h } = stripSize(row.length);
+    const canvas = createCanvas(w, h);
+    drawPosterStrip(canvas.getContext('2d'), row, FONT);
+    pngs.push(await canvas.encode('png'));
+  }
+  stripCache.set(cacheKey, { at: Date.now(), pngs });
+  if (stripCache.size > 40) stripCache.delete(stripCache.keys().next().value as string);
+  return pngs;
+}
+
+function countText(list: Entry[]): string {
+  const n = (k: (e: Entry) => boolean) => list.filter(k).length;
+  const parts = [
+    [n((e) => e.kind === 'фильм'), ['фильм', 'фильма', 'фильмов']],
+    [n((e) => e.kind === 'сериал'), ['сезон', 'сезона', 'сезонов']],
+    [n((e) => e.kind !== 'фильм' && e.kind !== 'сериал'), ['часть', 'части', 'частей']],
+  ] as const;
+  const plural = (x: number, f: readonly string[]) => f[x % 10 === 1 && x % 100 !== 11 ? 0 : x % 10 >= 2 && x % 10 <= 4 && (x % 100 < 10 || x % 100 >= 20) ? 1 : 2];
+  return parts
+    .filter(([x]) => x > 0)
+    .map(([x, f]) => `${x} ${plural(x, f)}`)
+    .join(' · ');
+}
+
+async function view(key: string, f: Franchise, mode: 'rel' | 'ev', page = 0) {
   const list = mode === 'ev' ? f.events : f.release;
   const same = f.events.map((e) => e.title).join('|') === f.release.map((e) => e.title).join('|');
-  const MAX = 30;
-  const lines = list.slice(0, MAX).map((e, k) => entryLine(e, k + 1));
-  if (list.length > MAX) lines.push(`-# …и ещё ${list.length - MAX}`);
-  const sub =
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const slice = list.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+
+  const years = list.map((e) => e.date?.slice(0, 4)).filter(Boolean).sort() as string[];
+  const span = years.length ? (years[0] === years[years.length - 1] ? years[0] : `${years[0]}–${years[years.length - 1]}`) : '';
+  const head =
     mode === 'ev'
-      ? `🌌 Порядок по событиям — ${f.eventsNote}${same ? ' (совпадает с порядком выхода)' : ''}`
-      : `📅 Порядок выхода — по датам премьер${same ? ' (совпадает с порядком по событиям)' : ''}`;
-  let desc = `${sub}\n\n${lines.join('\n')}`;
-  if (f.note) desc += `\n\n-# ℹ️ ${f.note}`;
-  if (f.truncated) desc += `\n-# Вселенная очень большая — показаны первые ${MAX_NODES} частей.`;
-  const e = new EmbedBuilder().setColor(0x7f77dd).setTitle(`🧭 ${truncate(f.title, 230)}`).setDescription(truncate(desc, 4000));
-  if (f.schedule) e.addFields({ name: `🔴 Сейчас выходит: ${truncate(f.schedule.title, 200)}`, value: truncate(scheduleText(f.schedule), 1024) });
-  e.setFooter({ text: 'Жирным — основная история • ответ видишь только ты • AniList · Shikimori · TMDB' });
+      ? `🌌 **Порядок по событиям**${same ? '' : ` — ${f.eventsNote}`}`
+      : '📅 **Порядок выхода** — по датам премьер';
+  const lines = [
+    head,
+    `-# ${[countText(list), span].filter(Boolean).join(' · ')}${same ? ' · порядок выхода и событий совпадает' : ''}`,
+    '',
+    slice.map((e, k) => entryBlock(e, page * PER_PAGE + k + 1)).join('\n'),
+  ];
+  if (f.note) lines.push('', `-# ℹ️ ${f.note}`);
+  if (f.truncated) lines.push(`-# Вселенная очень большая — показаны первые ${MAX_NODES} частей.`);
+
+  const e = new EmbedBuilder().setColor(0x7f77dd).setTitle(`🧭 ${clip(f.title, 230)}`).setDescription(clip(lines.join('\n'), 4000));
+  // Полоса постеров фильмов этой страницы (сезоны сериалов и TV-аниме не показываем)
+  const films = slice.map((x, k) => ({ x, n: page * PER_PAGE + k + 1 })).filter(({ x }) => x.kind === 'фильм');
+  const strips = films.length ? await posterStrip(`${key}|${mode}|${page}`, films, list).catch(() => [] as Buffer[]) : [];
+  if (strips.length) e.setImage('attachment://posters-0.png');
+  else if (f.poster) e.setThumbnail(f.poster);
+  e.setFooter({
+    text: `${pages > 1 ? `Страница ${page + 1} из ${pages} • ` : ''}Жирным — основная история • видишь только ты • AniList · Shikimori · TMDB`,
+  });
 
   const rows: any[] = [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`wo:v:rel:${key}`)
+        .setCustomId(`wo:t:rel:${key}`)
         .setLabel('По выходу')
         .setEmoji('📅')
         .setStyle(mode === 'rel' ? ButtonStyle.Primary : ButtonStyle.Secondary),
       new ButtonBuilder()
-        .setCustomId(`wo:v:ev:${key}`)
+        .setCustomId(`wo:t:ev:${key}`)
         .setLabel('По событиям')
         .setEmoji('🌌')
         .setStyle(mode === 'ev' ? ButtonStyle.Primary : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('wo:search').setLabel('Найти другое').setEmoji('🔎').setStyle(ButtonStyle.Secondary),
     ),
   ];
+  if (pages > 1) {
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`wo:v:${mode}:${page - 1}:${key}`)
+          .setEmoji('◀️')
+          .setLabel('Назад')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page === 0),
+        new ButtonBuilder()
+          .setCustomId(`wo:v:${mode}:${page + 1}:${key}`)
+          .setEmoji('▶️')
+          .setLabel('Дальше')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page >= pages - 1),
+      ),
+    );
+  }
+  // Меню частей — для текущей страницы, в том же порядке
   const seen = new Set<string>();
-  const opts = list
-    .filter((x) => x.pick && !seen.has(x.pick) && seen.add(x.pick))
+  const opts = slice
+    .map((x, k) => ({ x, n: page * PER_PAGE + k + 1 }))
+    .filter(({ x }) => x.pick && !seen.has(x.pick) && seen.add(x.pick))
     .slice(0, 25)
-    .map((x) => ({
-      label: truncate(x.title, 100),
-      description: truncate(`${x.kind} · ${year(x.date)}`, 100),
+    .map(({ x, n }) => ({
+      label: clip(`${n}. ${x.title}`, 100),
+      description: clip(`${x.kind} · ${year(x.date)}`, 100),
       value: x.pick!,
     }));
   if (opts.length) {
     rows.push(
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder()
-          .setCustomId('watch:pick:wo:0')
-          .setPlaceholder('Открыть часть: описание, трейлер, «Буду смотреть», «Напомнить»…')
+          .setCustomId(`watch:pick:wo:${page}`)
+          .setPlaceholder('Открыть часть: описание, трейлер, «Буду смотреть»…')
           .addOptions(opts),
       ),
     );
   }
-  return { content: '', embeds: [e], components: rows };
+  // Если что-то из серии сейчас выходит — отдельный блок-предупреждение с графиком серий
+  // Следующие ряды постеров — отдельными блоками сразу под списком
+  const more = strips.slice(1).map((_, k) => new EmbedBuilder().setColor(0x7f77dd).setImage(`attachment://posters-${k + 1}.png`));
+  const embeds = [e, ...more, ...(f.schedule ? [scheduleEmbed(f.schedule)] : [])];
+  return {
+    content: '',
+    embeds,
+    components: rows,
+    // attachments: [] — убрать картинки прошлой страницы
+    attachments: [],
+    files: strips.map((png, k) => new AttachmentBuilder(png, { name: `posters-${k}.png` })),
+  };
 }
 
 // ───────────────────────── поиск ─────────────────────────
@@ -521,8 +735,18 @@ interface Hit {
   emoji: string;
 }
 
-async function search(q: string): Promise<Hit[]> {
+/** Обещание с ограничением по времени: подсказкам Discord нужен ответ за 3 секунды */
+const within = <T,>(p: Promise<T>, ms: number): Promise<T> =>
+  Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+/**
+ * Поиск по всем источникам сразу: ручные вселенные, Shikimori (русские названия аниме),
+ * AniList (английские/ромадзи), TMDB (фильмы и сериалы на любом языке).
+ * fast — для подсказок при вводе: короткие таймауты и без запроса русских названий к AniList-результатам.
+ */
+async function search(q: string, fast = false): Promise<Hit[]> {
   const ql = q.toLowerCase().trim();
+  const t = fast ? 2000 : 8000;
   const hits: Hit[] = [];
   for (const u of universes()) {
     const names = [u.title, ...(u.aliases ?? [])].map((x) => x.toLowerCase());
@@ -530,16 +754,27 @@ async function search(q: string): Promise<Hit[]> {
       hits.push({ label: truncate(`Вселенная: ${u.title}`, 100), description: `${u.items.length} частей · ручная хронология`, value: `u:${u.key}`, emoji: '🌌' });
     }
   }
-  const [ani, tm] = await Promise.allSettled([
-    anilist(
-      `query ($q: String) { Page(perPage: 8) { media(search: $q, type: ANIME, sort: SEARCH_MATCH) { id idMal format startDate { year } title { romaji english } } } }`,
-      { q },
+  const [shiki, ani, tm] = await Promise.allSettled([
+    within(shikiSearch(q, 8), t),
+    within(
+      anilist(
+        `query ($q: String) { Page(perPage: 6) { media(search: $q, type: ANIME, sort: SEARCH_MATCH) { id idMal format startDate { year } title { romaji english } } } }`,
+        { q },
+      ),
+      t,
     ),
-    tmdbGet('/search/multi', { query: q }),
+    within(tmdbGet('/search/multi', { query: q }), t),
   ]);
+  const malSeen = new Set<number>();
+  if (shiki.status === 'fulfilled') {
+    for (const a of shiki.value) {
+      malSeen.add(a.id);
+      hits.push({ label: truncate(a.title, 100), description: truncate(`аниме · ${a.kind} · ${a.year}`, 100), value: `s:${a.id}`, emoji: '🍥' });
+    }
+  }
   if (ani.status === 'fulfilled') {
-    const list: any[] = ani.value?.Page?.media ?? [];
-    const ru = await shikiRussianNames(list.map((m) => m.idMal).filter(Boolean));
+    const list: any[] = (ani.value?.Page?.media ?? []).filter((m: any) => !m.idMal || !malSeen.has(m.idMal));
+    const ru = fast ? new Map<number, string>() : await shikiRussianNames(list.map((m) => m.idMal).filter(Boolean));
     for (const m of list) {
       hits.push({
         label: truncate((m.idMal && ru.get(m.idMal)) || m.title?.english || m.title?.romaji || '?', 100),
@@ -566,6 +801,59 @@ async function search(q: string): Promise<Hit[]> {
   return hits.filter((h) => !uniq.has(h.value) && uniq.add(h.value)).slice(0, 25);
 }
 
+// ───────────────────────── /watchorder ─────────────────────────
+
+/** Подсказки по мере ввода: «🍥 Атака титанов · аниме · TV · 2013» */
+export async function onAutocomplete(i: AutocompleteInteraction) {
+  const q = i.options.getFocused().trim();
+  if (q.length < 2) {
+    const u = universes().slice(0, 25).map((x) => ({ name: truncate(`🌌 Вселенная: ${x.title}`, 100), value: `u:${x.key}` }));
+    return i.respond(u).catch(() => {});
+  }
+  const hits = await search(q, true).catch(() => [] as Hit[]);
+  return i
+    .respond(hits.map((h) => ({ name: truncate(`${h.emoji} ${h.label} · ${h.description}`, 100), value: h.value })))
+    .catch(() => {});
+}
+
+const KEY_RE = /^[asmtu]:[\w-]+$/;
+
+/** Показать хронологию по ключу (общая часть для меню выбора и команды) */
+async function showByKey(i: any, key: string) {
+  try {
+    const f = await franchise(key);
+    const differs = f.events.map((e) => e.title).join('|') !== f.release.map((e) => e.title).join('|');
+    return await i.editReply(await view(key, f, differs ? 'ev' : 'rel'));
+  } catch (e) {
+    return i.editReply({ content: `⚠️ Не удалось собрать хронологию: ${(e as Error).message}`, embeds: [], components: [] });
+  }
+}
+
+/** Варианты на выбор, если человек нажал Enter, не выбрав подсказку */
+function hitsPayload(q: string, hits: Hit[]) {
+  if (!hits.length) return { content: `🔎 По запросу «${plain(truncate(q, 80))}» ничего не нашёл. Попробуй другое название — можно по-английски.`, components: [] };
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder().setCustomId('wo:pick').setPlaceholder('Что именно?').addOptions(hits),
+  );
+  return { content: `🔎 Нашёл по запросу «${plain(truncate(q, 80))}». Выбери:`, components: [row] };
+}
+
+export async function onCommand(i: ChatInputCommandInteraction) {
+  const q = i.options.getString('query', true).trim();
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  if (KEY_RE.test(q)) {
+    await i.editReply('⏳ Собираю хронологию… (большие вселенные — до 20 секунд)');
+    return showByKey(i, q);
+  }
+  const hits = await search(q).catch(() => [] as Hit[]);
+  // Одно точное совпадение — сразу показываем
+  if (hits.length === 1) {
+    await i.editReply('⏳ Собираю хронологию…');
+    return showByKey(i, hits[0].value);
+  }
+  return i.editReply(hitsPayload(q, hits));
+}
+
 // ───────────────────────── панель ─────────────────────────
 
 function panelPayload() {
@@ -579,6 +867,8 @@ function panelPayload() {
         '📅 **По выходу** — как выходило в прокат и эфир',
         '🌌 **По событиям** — по порядку событий внутри вселенной',
         '🔴 Если что-то сейчас выходит — покажу расписание серий',
+        '',
+        '⌨️ Быстрее всего — команда **/хронология**: начни печатать название, и бот сразу предложит варианты. Или нажми кнопку ниже.',
       ].join('\n'),
     )
     .setFooter({ text: 'Ответ видишь только ты • AniList · Shikimori · TMDB' });
@@ -636,33 +926,25 @@ export async function onComponent(i: ComponentInteraction) {
     const q = i.fields.getTextInputValue('q').trim();
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     const hits = await search(q).catch(() => [] as Hit[]);
-    if (!hits.length) return i.editReply(`🔎 По запросу «${plain(truncate(q, 80))}» ничего не нашёл. Попробуй другое название — можно по-английски.`);
-    const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder().setCustomId('wo:pick').setPlaceholder('Что именно?').addOptions(hits),
-    );
-    return i.editReply({ content: `🔎 Нашёл по запросу «${plain(truncate(q, 80))}». Выбери:`, components: [row] });
+    return i.editReply(hitsPayload(q, hits));
   }
 
   // Выбрали совпадение → хронология
   if (action === 'pick' && i.isStringSelectMenu()) {
     const key = i.values[0];
     await i.update({ content: '⏳ Собираю хронологию… (большие вселенные — до 20 секунд)', components: [], embeds: [] });
-    try {
-      const f = await franchise(key);
-      const differs = f.events.map((e) => e.title).join('|') !== f.release.map((e) => e.title).join('|');
-      return await i.editReply(view(key, f, differs ? 'ev' : 'rel'));
-    } catch (e) {
-      return i.editReply({ content: `⚠️ Не удалось собрать хронологию: ${(e as Error).message}` });
-    }
+    return showByKey(i, key);
   }
 
   // Переключение вкладок
-  if (action === 'v' && i.isButton()) {
+  // Вкладки (wo:t:<режим>:<ключ>) и листание страниц (wo:v:<режим>:<страница>:<ключ>)
+  if ((action === 'v' || action === 't') && i.isButton()) {
     const mode = parts[2] === 'ev' ? 'ev' : 'rel';
-    const key = parts.slice(3).join(':');
+    const page = action === 't' ? 0 : Number(parts[3]) || 0;
+    const key = parts.slice(action === 't' ? 3 : 4).join(':');
     await i.deferUpdate();
     try {
-      return await i.editReply(view(key, await franchise(key), mode));
+      return await i.editReply(await view(key, await franchise(key), mode, page));
     } catch (e) {
       return i.followUp({ content: `⚠️ ${(e as Error).message}`, flags: MessageFlags.Ephemeral });
     }
@@ -674,13 +956,8 @@ export async function onComponent(i: ComponentInteraction) {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const s = source === 'shiki' ? await animeScheduleByMal(Number(id)) : source === 'tmdbt' ? await tvSchedule(Number(id)) : null;
-      if (!s || !s.episodes.length) return i.editReply('📅 Расписание серий пока не объявлено. Обычно оно появляется ближе к премьере.');
-      const e = new EmbedBuilder()
-        .setColor(0x7f77dd)
-        .setTitle(`📅 Расписание серий — ${truncate(s.title, 200)}`)
-        .setDescription(truncate(scheduleText(s, 12), 4000))
-        .setFooter({ text: 'Время — в твоём часовом поясе • AniList / TMDB' });
-      return i.editReply({ embeds: [e] });
+      if (!s) return i.editReply('📅 Расписание серий пока не объявлено. Обычно оно появляется ближе к премьере.');
+      return i.editReply({ embeds: [scheduleEmbed(s, 20)] });
     } catch (e) {
       return i.editReply(`⚠️ Не удалось загрузить расписание: ${(e as Error).message}`);
     }

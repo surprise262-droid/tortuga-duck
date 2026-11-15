@@ -479,3 +479,14 @@ export async function shikiRussianNames(ids: number[]): Promise<Map<number, stri
   }
   return out;
 }
+
+/** Поиск аниме на Shikimori — понимает русские названия (AniList их не знает). id = id MyAnimeList. */
+export async function shikiSearch(q: string, limit = 8): Promise<{ id: number; title: string; kind: string; year: string }[]> {
+  const { data } = await shikiGet(loadCfg(), `/api/animes?search=${encodeURIComponent(q)}&limit=${limit}&order=popularity`);
+  return (Array.isArray(data) ? data : []).map((a: any) => ({
+    id: Number(a.id),
+    title: a.russian || a.name,
+    kind: KIND_RU[a.kind ?? ''] ?? a.kind ?? 'аниме',
+    year: (a.aired_on ?? '').slice(0, 4) || '?',
+  }));
+}

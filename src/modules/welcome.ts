@@ -25,7 +25,7 @@ interface WelcomeConfig {
 const IMG_EXT = /\.(png|jpe?g|webp|gif)$/i;
 
 // Шрифт с кириллицей (в Docker ставится пакет fonts-dejavu-core)
-const FONT = (() => {
+export const FONT = (() => {
   const candidates = [
     path.join(config.assetsDir, 'fonts', 'title.ttf'),
     '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
